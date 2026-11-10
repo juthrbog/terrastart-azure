@@ -86,7 +86,7 @@ tasks:
     env:
       # Share downloaded provider binaries across every project forked from
       # this template. `tofu init` links from the cache instead of
-      # re-fetching ~600 MB of AWS provider per project. Respects an existing
+      # re-fetching ~240 MB of azurerm provider per project. Respects an existing
       # TF_PLUGIN_CACHE_DIR export so users can point it elsewhere.
       TF_PLUGIN_CACHE_DIR:
         sh: echo "${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
@@ -111,7 +111,7 @@ tasks:
       # Build a `<name>  <description>` line per deployment, so fzf shows the
       # description next to the deployment name. The name alone does not tell
       # apart deployments that share an env (e.g. two deployments of different
-      # services in the same account). `description:` is optional.
+      # services in the same subscription). `description:` is optional.
       # Without it, the line has only the name. fzf's `{1}` placeholder sends
       # the deployment name to --preview. The last `awk` removes the
       # description from the selection, so `tofu init` and
@@ -136,8 +136,8 @@ tasks:
           echo "No deployment selected. Nothing was changed." >&2
           exit 1
         fi
-        if [ ! -f "backends/$deployment.s3.tfbackend" ]; then
-          echo "deployments/backends/$deployment.s3.tfbackend does not exist. Copy deployments/backends/default.s3.tfbackend and fill it in." >&2
+        if [ ! -f "backends/$deployment.azurerm.tfbackend" ]; then
+          echo "deployments/backends/$deployment.azurerm.tfbackend does not exist. Copy deployments/backends/default.azurerm.tfbackend and fill it in." >&2
           exit 1
         fi
         # OpenTofu refuses to use the plugin cache unless the directory
@@ -145,7 +145,7 @@ tasks:
         mkdir -p "$TF_PLUGIN_CACHE_DIR"
         echo "Switching to $deployment"
         rm -f .terraform/environment
-        "{{.TF_BIN}}" init -backend-config="backends/$deployment.s3.tfbackend" -reconfigure
+        "{{.TF_BIN}}" init -backend-config="backends/$deployment.azurerm.tfbackend" -reconfigure
         "{{.TF_BIN}}" workspace select -or-create=true "$deployment"
 
   # A fork uses one CI platform. These two tasks delete the files of the other
@@ -197,10 +197,10 @@ tasks:
         echo "Deleted. GitHub Actions is now the CI platform."
         echo
         echo "Next steps (see README.md):"
-        echo "  1. Make an IAM OIDC provider and roles for GitHub (CI Auth > GitHub OIDC)."
-        echo "  2. Set ci.aws_role_arn in each deployment config."
+        echo "  1. Make a managed identity per deployment with federated credentials for GitHub (CI Auth > GitHub OIDC)."
+        echo "  2. Set azure.subscription_id, azure.tenant_id and ci.azure_client_id in each deployment config."
         echo "  3. Make the GitHub Environments develop, stage, prod and destroy (Pipeline > GitHub Environments)."
-        echo "  4. If an apply can take longer than 55 minutes, set the AWS_ROLE_DURATION_SECONDS variable (CI Auth > AWS session length on GitHub)."
+        echo "  4. If a job can take longer than 60 minutes, set the TF_TIMEOUT_MINUTES variable (CI Auth > Job time limit (GitHub))."
         echo "  5. Delete the GitLab parts of README.md."
 
   ci:use-gitlab:
@@ -242,8 +242,8 @@ tasks:
         echo "Deleted. GitLab CI is now the CI platform."
         echo
         echo "Next steps (see README.md):"
-        echo "  1. Make an IAM OIDC provider and roles for GitLab (CI Auth > GitLab OIDC)."
-        echo "  2. Set ci.aws_role_arn in each deployment config."
+        echo "  1. Make a managed identity per deployment with federated credentials for GitLab (CI Auth > GitLab OIDC)."
+        echo "  2. Set azure.subscription_id, azure.tenant_id and ci.azure_client_id in each deployment config."
         echo "  3. Add a job per deployment in .ci/configs/ (Adding a deployment)."
         echo "  4. Build the CI image from .ci/image/Dockerfile and push it to the registry (CI image)."
         echo "  5. Protect the default branch and the prod environments (Pipeline > GitLab environments)."

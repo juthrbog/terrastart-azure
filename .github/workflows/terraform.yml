@@ -27,11 +27,25 @@
 # A merge queue run (merge_group) runs only validate and setup. The pull
 # request plan has already run.
 #
-# AWS session length: the repository variable AWS_ROLE_DURATION_SECONDS sets
-# how long the AWS credentials of a job last (default 3600, one hour). Each
-# job stops 5 minutes before that. Raise it for long applies, and raise the
-# MaxSessionDuration of every deployment role to match. See README.md
-# ("AWS session length on GitHub").
+# Job time limit: the repository variable TF_TIMEOUT_MINUTES sets how long
+# each plan, apply or destroy job may run (default 60, one hour). Raise it
+# for long applies. See README.md ("Job time limit (GitHub)").
+#
+# Azure access: there is no login step. Jobs that run tf.sh get
+# `id-token: write`, and OpenTofu's azurerm provider and backend ask GitHub
+# for OIDC tokens themselves (ARM_USE_OIDC=true, set by tf.sh). Azure trades
+# each token for access as the deployment's CI identity (ci.azure_client_id
+# in its config). This works only if the identity has a federated
+# credential whose subject matches the token exactly. The subject depends
+# on the job:
+#   - plan and destroy-plan jobs (no environment):
+#       pull request (plan only): repo:<owner>/<repo>:pull_request
+#       push or manual run:       repo:<owner>/<repo>:ref:refs/heads/<branch>
+#   - apply-<tier> jobs:          repo:<owner>/<repo>:environment:<tier>
+#   - destroy-<tier> jobs:        repo:<owner>/<repo>:environment:destroy
+# Repositories made, renamed or moved on github.com after 2026-07-15 send
+# repo:<owner>@<owner_id>/<repo>@<repo_id>:... instead. See README.md
+# ("GitHub OIDC") for which subjects to add.
 #
 # The tiers here must match TIERS in .ci/scripts/tf.sh. To add, remove or
 # rename a tier, see README.md ("Change the tiers").
@@ -42,7 +56,7 @@
 # do not list deployments in this file.
 #
 # Why a reusable workflow: each tier job above calls tf-deploy.yml, which
-# holds the real steps (checkout, OpenTofu, AWS credentials, plan files) once.
+# holds the real steps (checkout, OpenTofu, tf.sh, plan files) once.
 # A job here only says which command, which tier, and which GitHub
 # Environment. Without it, the same 40 lines of steps would repeat 12 times.
 #
@@ -76,6 +90,9 @@
 #     reviewers.
 #   - Limit all four environments (develop, stage, prod and destroy) to the
 #     default branch.
+#   - The environment name is part of the OIDC subject (see "Azure access"
+#     above), and Azure compares it case by case. If you rename an
+#     environment, change the federated credentials too.
 
 name: terraform
 
@@ -110,7 +127,7 @@ on:
         type: boolean
         default: false
 
-# Least access by default. Jobs that talk to AWS add id-token: write.
+# Least access by default. Jobs that talk to Azure add id-token: write.
 permissions:
   contents: read
 
@@ -122,9 +139,9 @@ defaults:
 
 jobs:
   # Checks formatting, runs tofu validate, and runs shellcheck on
-  # .ci/scripts/. It needs no AWS access, so it also runs on pull requests
+  # .ci/scripts/. It needs no Azure access, so it also runs on pull requests
   # from forks. GitHub gives those no OIDC token, so they run only this job
-  # and the setup job. No job that uses AWS runs.
+  # and the setup job. No job that uses Azure runs.
   validate:
     runs-on: ubuntu-latest
     steps:
@@ -157,10 +174,8 @@ jobs:
       apply: ${{ steps.decide.outputs.apply }}
       destroy_plan: ${{ steps.decide.outputs.destroy_plan }}
       destroy: ${{ steps.decide.outputs.destroy }}
-      # AWS session length in seconds, and the job time limit in minutes
-      # that goes with it. Every tf-deploy.yml call gets both.
-      role_duration_seconds: ${{ steps.session.outputs.role_duration_seconds }}
-      timeout_minutes: ${{ steps.session.outputs.timeout_minutes }}
+      # The job time limit in minutes. Every tf-deploy.yml call gets it.
+      timeout_minutes: ${{ steps.timeout.outputs.timeout_minutes }}
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -207,28 +222,24 @@ jobs:
           ONLY_DEPLOYMENT: ${{ inputs.destroy == true && inputs.deployment || '' }}
         run: .ci/scripts/tf.sh matrix | tee -a "$GITHUB_OUTPUT"
 
-      # AWS_ROLE_DURATION_SECONDS is a repository variable (Settings >
-      # Secrets and variables > Actions > Variables). Unset means 3600. AWS
-      # allows 900 to 43200. Each deployment role's MaxSessionDuration must
-      # be at least this long. The job limit is 5 minutes shorter, so a slow
-      # job stops before its credentials expire. GitHub expressions cannot do
-      # math, so this step works out the number. Note: GitHub-hosted runners
-      # stop every job after 6 hours, so more than 21900 gives no extra time.
-      - name: Work out the AWS session length
-        id: session
+      # TF_TIMEOUT_MINUTES is a repository variable (Settings > Secrets and
+      # variables > Actions > Variables). Unset means 60. It must be a whole
+      # number from 1 to 360. This step checks it once, so a bad value fails
+      # here with a clear message, not later in every job. Azure needs no
+      # matching setting: the azurerm provider and backend get new tokens
+      # by themselves when the old ones expire. Note: GitHub-hosted runners
+      # stop every job after 6 hours, so 360 is the most that helps there.
+      - name: Check the job time limit
+        id: timeout
         env:
-          DURATION: ${{ vars.AWS_ROLE_DURATION_SECONDS }}
+          TIMEOUT: ${{ vars.TF_TIMEOUT_MINUTES }}
         run: |
-          duration="${DURATION:-3600}"
-          if [[ ! "$duration" =~ ^[0-9]+$ ]] || ((10#$duration < 900 || 10#$duration > 43200)); then
-            echo "::error::AWS_ROLE_DURATION_SECONDS is '$duration'. It must be a whole number of seconds from 900 to 43200."
+          timeout="${TIMEOUT:-60}"
+          if [[ ! "$timeout" =~ ^[0-9]+$ ]] || ((10#$timeout < 1 || 10#$timeout > 360)); then
+            echo "::error::TF_TIMEOUT_MINUTES is '$timeout'. It must be a whole number of minutes from 1 to 360."
             exit 1
           fi
-          duration=$((10#$duration))
-          {
-            echo "role_duration_seconds=$duration"
-            echo "timeout_minutes=$((duration / 60 - 5))"
-          } | tee -a "$GITHUB_OUTPUT"
+          echo "timeout_minutes=$((10#$timeout))" | tee -a "$GITHUB_OUTPUT"
 
       # The rules below copy the GitLab .plan and .apply rules. "changed"
       # means a file under deployments/ or terraform/ changed.
@@ -354,7 +365,7 @@ jobs:
           fi
 
           # The rules above already give "false" for a merge queue run. Say
-          # it again here, so a later rule change cannot add AWS jobs to it.
+          # it again here, so a later rule change cannot add Azure jobs to it.
           if [[ "$EVENT_NAME" == merge_group ]]; then
             plan=false apply=false destroy_plan=false destroy=false
           fi
@@ -390,7 +401,6 @@ jobs:
     with:
       command: plan
       deployments: ${{ needs.setup.outputs.develop }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   apply-develop:
@@ -404,7 +414,6 @@ jobs:
       command: apply
       deployments: ${{ needs.plan-develop.outputs.changed }}
       environment: develop
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   plan-stage:
@@ -417,7 +426,6 @@ jobs:
     with:
       command: plan
       deployments: ${{ needs.setup.outputs.stage }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   apply-stage:
@@ -431,7 +439,6 @@ jobs:
       command: apply
       deployments: ${{ needs.plan-stage.outputs.changed }}
       environment: stage
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   plan-prod:
@@ -444,7 +451,6 @@ jobs:
     with:
       command: plan
       deployments: ${{ needs.setup.outputs.prod }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   # The prod environment's required reviewers must approve this job before
@@ -460,7 +466,6 @@ jobs:
       command: apply
       deployments: ${{ needs.plan-prod.outputs.changed }}
       environment: prod
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -481,7 +486,6 @@ jobs:
     with:
       command: destroy-plan
       deployments: ${{ needs.setup.outputs.develop }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   destroy-develop:
@@ -495,7 +499,6 @@ jobs:
       command: destroy
       deployments: ${{ needs.setup.outputs.develop }}
       environment: destroy
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   destroy-plan-stage:
@@ -508,7 +511,6 @@ jobs:
     with:
       command: destroy-plan
       deployments: ${{ needs.setup.outputs.stage }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   destroy-stage:
@@ -522,7 +524,6 @@ jobs:
       command: destroy
       deployments: ${{ needs.setup.outputs.stage }}
       environment: destroy
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   destroy-plan-prod:
@@ -535,7 +536,6 @@ jobs:
     with:
       command: destroy-plan
       deployments: ${{ needs.setup.outputs.prod }}
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
 
   destroy-prod:
@@ -549,5 +549,4 @@ jobs:
       command: destroy
       deployments: ${{ needs.setup.outputs.prod }}
       environment: destroy
-      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
       timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}

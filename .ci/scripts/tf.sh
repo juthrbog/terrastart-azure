@@ -25,33 +25,39 @@
 #                                destroy-plan and destroy.
 #   ONLY_DEPLOYMENT              Optional, matrix only. Print only this
 #                                deployment. Every other tier is "[]".
-#   PRINT_OIDC_CLAIMS            "true" (default) prints the GitLab JWT claims
-#                                when auth fails. In CI, the AWS identity
-#                                check always runs. On your own machine,
-#                                "false" skips the identity check.
+#   PRINT_OIDC_CLAIMS            "true" (default) prints the claims of the CI
+#                                job's OIDC token when Entra ID rejects it. In
+#                                CI, the Azure identity check always runs. On
+#                                your own machine, "false" skips the identity
+#                                check.
 #   GITLAB_CI                    Set by GitLab. Turns on GitLab auth mode.
 #   GITLAB_OIDC_TOKEN            JWT that GitLab makes for the job (GitLab only).
-#   AWS_WEB_IDENTITY_TOKEN_FILE  Optional, GitLab only. Where to write that JWT.
-#                                The default is a file for this job only,
-#                                "${TMPDIR:-/tmp}/gitlab-oidc-<job id>.jwt".
-#                                tf.sh deletes the file when it exits.
 #   GITHUB_ACTIONS               Set by GitHub. Turns on GitHub auth mode.
+#   ACTIONS_ID_TOKEN_REQUEST_URL, ACTIONS_ID_TOKEN_REQUEST_TOKEN
+#                                Set by GitHub when the job has the
+#                                "id-token: write" permission (GitHub only).
+#                                OpenTofu uses them to get OIDC tokens.
 #   GITHUB_STEP_SUMMARY          Set by GitHub Actions. When set, plan and
 #                                destroy-plan write a summary to it.
 #
 # Auth mode:
-#   GitLab CI       tf.sh trades the job JWT for the ci.aws_role_arn role. It
-#                   ignores (unsets) any static AWS keys and AWS_PROFILE.
-#   GitHub Actions  aws-actions/configure-aws-credentials must run first.
-#   Your machine    The normal AWS credential chain (AWS_PROFILE, SSO, ...).
-# After auth, tf.sh checks with `aws sts get-caller-identity` that it runs as
-# the ci.aws_role_arn role (in CI) or in that role's account (on your
-# machine). In CI the aws CLI must be installed.
+#   GitLab CI       OpenTofu trades the job JWT (GITLAB_OIDC_TOKEN) for an
+#                   Entra ID token for ci.azure_client_id.
+#   GitHub Actions  OpenTofu asks GitHub for OIDC tokens itself and trades
+#                   them for Entra ID tokens for ci.azure_client_id. No
+#                   azure/login step is needed.
+#   Your machine    Your Azure CLI login (az login).
+# In CI, tf.sh unsets other Azure credentials first, so that OpenTofu cannot
+# use some other identity. Then it checks with curl and jq that the token
+# trade works and that the identity can read azure.subscription_id. On your
+# machine, it checks your az login instead (if the az CLI is installed).
 #
 # A deployment is one file in deployments/configs/. The file name, the
 # workspace name and DEPLOYMENT are the same value:
-# <env>-<deployment_id>. This script reads env, deployment_id, aws.region
-# and ci.aws_role_arn from that file with yq (mikefarah yq 4.18 or newer). The plan step also needs jq in CI.
+# <env>-<deployment_id>. This script reads env, deployment_id,
+# azure.location, azure.subscription_id, azure.tenant_id and
+# ci.azure_client_id from that file with yq (mikefarah yq 4.18 or newer).
+# In CI, the script also needs curl and jq.
 
 # This check must run before any bash 4 feature. macOS ships bash 3.2 as
 # /bin/bash, which has no mapfile and no associative arrays.
@@ -91,6 +97,16 @@ TF_BIN="${TF_BIN:-tofu}"
 # it stops calls to the HashiCorp version check service.
 export TF_IN_AUTOMATION=1
 export CHECKPOINT_DISABLE=1
+
+# Azure public cloud endpoints. Other clouds are not supported.
+ENTRA_LOGIN_URL="https://login.microsoftonline.com"
+ARM_URL="https://management.azure.com"
+# The audience that Entra ID expects in a CI OIDC token. Each federated
+# identity credential must list it.
+OIDC_TOKEN_AUDIENCE="api://AzureADTokenExchange"
+
+# Subscription IDs, tenant IDs and client IDs are GUIDs.
+GUID_REGEX='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
@@ -153,7 +169,7 @@ require_tf() {
 # empty when it is not.
 read_config() {
   local file="$1" fields
-  if ! fields="$(yq '.env // "", .deployment_id // "", .aws.region // "", .ci.aws_role_arn // "", (.env | style), (.deployment_id | style)' "$file")"; then
+  if ! fields="$(yq '.env // "", .deployment_id // "", .azure.location // "", .azure.subscription_id // "", .azure.tenant_id // "", .ci.azure_client_id // "", (.env | style), (.deployment_id | style)' "$file")"; then
     # yq prints its own error above this line.
     error "yq could not read ${file#"$REPO_ROOT"/}. See the yq error above."
     return 1
@@ -162,10 +178,12 @@ read_config() {
   mapfile -t values <<<"$fields"
   cfg_env="${values[0]:-}"
   cfg_deployment_id="${values[1]:-}"
-  cfg_region="${values[2]:-}"
-  cfg_role_arn="${values[3]:-}"
-  cfg_env_style="${values[4]:-}"
-  cfg_deployment_id_style="${values[5]:-}"
+  cfg_location="${values[2]:-}"
+  cfg_subscription_id="${values[3]:-}"
+  cfg_tenant_id="${values[4]:-}"
+  cfg_client_id="${values[5]:-}"
+  cfg_env_style="${values[6]:-}"
+  cfg_deployment_id_style="${values[7]:-}"
 }
 
 # True when YAML reads an unquoted value as a number, for example 12345678,
@@ -184,12 +202,14 @@ validate_config() {
   rel="${file#"$REPO_ROOT"/}"
 
   local field value
-  for field in env deployment_id aws.region ci.aws_role_arn; do
+  for field in env deployment_id azure.location azure.subscription_id azure.tenant_id ci.azure_client_id; do
     case "$field" in
       env) value="$cfg_env" ;;
       deployment_id) value="$cfg_deployment_id" ;;
-      aws.region) value="$cfg_region" ;;
-      ci.aws_role_arn) value="$cfg_role_arn" ;;
+      azure.location) value="$cfg_location" ;;
+      azure.subscription_id) value="$cfg_subscription_id" ;;
+      azure.tenant_id) value="$cfg_tenant_id" ;;
+      ci.azure_client_id) value="$cfg_client_id" ;;
     esac
     if [[ -z "$value" ]]; then
       error "'$field' is not set or is empty in $rel."
@@ -197,7 +217,7 @@ validate_config() {
     fi
   done
   if [[ "$ok" != true ]]; then
-    error "Every deployment config needs env, deployment_id, aws.region and ci.aws_role_arn. See deployments/configs/default.yaml."
+    error "Every deployment config needs env, deployment_id, azure.location, azure.subscription_id, azure.tenant_id and ci.azure_client_id. See deployments/configs/default.yaml."
     return 1
   fi
 
@@ -218,10 +238,24 @@ validate_config() {
     ok=false
   fi
 
-  if [[ ! "$cfg_role_arn" =~ ^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+ ]]; then
-    error "$rel has ci.aws_role_arn '$cfg_role_arn'. It must be an IAM role ARN, for example arn:aws:iam::123456789012:role/ci-my-repo-deploy."
+  # A region short name is lowercase letters and digits, for example eastus.
+  # A display name such as "East US" does not work.
+  if [[ ! "$cfg_location" =~ ^[a-z0-9]+$ ]]; then
+    error "$rel has azure.location '$cfg_location'. It must be a region short name in lowercase, for example eastus or westeurope. Run 'az account list-locations -o table' and use the Name column."
     ok=false
   fi
+
+  for field in azure.subscription_id azure.tenant_id ci.azure_client_id; do
+    case "$field" in
+      azure.subscription_id) value="$cfg_subscription_id" ;;
+      azure.tenant_id) value="$cfg_tenant_id" ;;
+      ci.azure_client_id) value="$cfg_client_id" ;;
+    esac
+    if [[ ! "$value" =~ $GUID_REGEX ]]; then
+      error "$rel has $field '$value'. It must be a GUID, for example 00000000-0000-0000-0000-000000000000."
+      ok=false
+    fi
+  done
 
   # Quoted values are always strings, so only unquoted values are a problem.
   local style
@@ -239,8 +273,8 @@ validate_config() {
     fi
   done
 
-  if [[ ! -f "$BACKENDS_DIR/$name.s3.tfbackend" ]]; then
-    error "Backend file deployments/backends/$name.s3.tfbackend does not exist. Copy deployments/backends/default.s3.tfbackend and fill it in."
+  if [[ ! -f "$BACKENDS_DIR/$name.azurerm.tfbackend" ]]; then
+    error "Backend file deployments/backends/$name.azurerm.tfbackend does not exist. Copy deployments/backends/default.azurerm.tfbackend and fill it in."
     ok=false
   fi
 
@@ -248,7 +282,7 @@ validate_config() {
 }
 
 # Load the config for $DEPLOYMENT, check it, and export the values the
-# OpenTofu steps and the AWS SDK need.
+# OpenTofu steps and the azurerm provider and backend need.
 load_deployment() {
   if [[ -z "${DEPLOYMENT:-}" ]]; then
     fail "DEPLOYMENT is not set. Set it to a config file name without '.yaml', for example develop-a1b2c3d4."
@@ -286,29 +320,80 @@ load_deployment() {
   export ENV="$cfg_env"
   export DEPLOYMENT_ID="$cfg_deployment_id"
   export DEPLOYMENT_WORKSPACE="$DEPLOYMENT"
-  export AWS_REGION="$cfg_region"
-  export AWS_DEFAULT_REGION="$cfg_region"
+  # The azurerm provider and backend read these. The provider also gets the
+  # same values from the config in providers.tf. The location goes to
+  # terraform/ through main.tf, so it needs no variable here.
+  export ARM_SUBSCRIPTION_ID="$cfg_subscription_id"
+  export ARM_TENANT_ID="$cfg_tenant_id"
 
-  echo "Deployment: $DEPLOYMENT (env=$ENV deployment_id=$DEPLOYMENT_ID region=$AWS_REGION)"
+  echo "Deployment: $DEPLOYMENT (env=$ENV deployment_id=$DEPLOYMENT_ID location=$cfg_location subscription=$ARM_SUBSCRIPTION_ID)"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AWS auth
+# Azure auth
+#
+# Secrets (OIDC tokens and access tokens) never go on a command line, because
+# other processes on the machine can read command lines (for example with
+# ps). printf is a bash builtin, so it starts no process. It writes the
+# secret to curl's stdin, and curl reads it with "-H @-" (a header) or
+# "--data-urlencode name@-" (a form field). Secrets also never go to a file
+# or to the log.
 
-# Print the claims inside the GitLab JWT, so you can compare them with the
-# role trust policy conditions.
-print_gitlab_claims() {
-  echo "Compare the JWT claims below against the role trust policy conditions:" >&2
-  if command -v jq >/dev/null 2>&1; then
-    # A JWT is header.payload.signature. The payload is base64url without
-    # padding, so convert it to plain base64 and add the padding back.
-    local payload
-    payload="$(printf '%s' "$GITLAB_OIDC_TOKEN" | cut -d. -f2 | tr '_-' '/+')"
-    while [[ $((${#payload} % 4)) -ne 0 ]]; do payload="${payload}="; done
-    printf '%s' "$payload" | base64 -d 2>/dev/null | jq '{sub, aud, ref, ref_type, project_path, environment}' >&2 || echo "  (claim decode failed)" >&2
+# Print the claims (the JSON payload) of a JWT read from stdin. Return
+# non-zero if it is not a JWT.
+jwt_claims() {
+  # A JWT is header.payload.signature. The payload is base64url without
+  # padding, so convert it to plain base64 and add the padding back.
+  local payload
+  payload="$(cut -d. -f2 | tr '_-' '/+')"
+  [[ -n "$payload" ]] || return 1
+  while [[ $((${#payload} % 4)) -ne 0 ]]; do payload="${payload}="; done
+  printf '%s' "$payload" | base64 -d 2>/dev/null | jq -ce . 2>/dev/null
+}
+
+# Print the claims of the CI job's OIDC token, so you can compare them with
+# the federated identity credential (issuer, subject and audience must match
+# exactly, and the match is case-sensitive). Never prints the token itself.
+#   $1: auth mode (gitlab or github)
+#   $2: the OIDC token
+print_oidc_claims() {
+  local mode="$1" token="$2" filter
+  case "$mode" in
+    gitlab) filter='{iss, sub, aud, project_path, project_id, ref, ref_type, ref_protected, environment}' ;;
+    github) filter='{iss, sub, aud, repository, repository_id, repository_owner_id, ref, event_name, environment, job_workflow_ref}' ;;
+  esac
+  echo "Compare these OIDC token claims with the federated identity credential (issuer = iss, subject = sub, audience = aud):" >&2
+  local claims
+  if claims="$(printf '%s' "$token" | jwt_claims)"; then
+    jq "$filter" <<<"$claims" >&2
   else
-    echo "  (install jq in this image to see decoded claims)" >&2
+    echo "  (claim decode failed)" >&2
   fi
+}
+
+# Print a hint for an AADSTS error code from Entra ID.
+#   $1: error_description from Entra ID
+aadsts_hint() {
+  local code
+  code="$(grep -Eo 'AADSTS[0-9]+' <<<"$1" | head -n 1 || true)"
+  case "$code" in
+    AADSTS700213)
+      echo "  Hint: no federated identity credential matches the token. Most often the subject is wrong. The match is exact and case-sensitive, and the message above shows the subject that was sent. A wrong issuer or audience can also give this error." ;;
+    AADSTS700211)
+      echo "  Hint: no federated identity credential has this token's issuer. GitLab: the issuer is the GitLab URL, for example https://gitlab.com. GitHub: https://token.actions.githubusercontent.com." ;;
+    AADSTS70021)
+      echo "  Hint: no federated identity credential matches the token. If you created the credential only a few minutes ago, wait a few minutes and run the job again." ;;
+    AADSTS70025)
+      echo "  Hint: the identity ci.azure_client_id has no federated identity credentials. Add one for this pipeline." ;;
+    AADSTS700016)
+      echo "  Hint: Entra ID cannot find ci.azure_client_id ($cfg_client_id) in tenant $cfg_tenant_id. Check both IDs in the deployment config." ;;
+    AADSTS700024)
+      echo "  Hint: the OIDC token has expired. Run the job again." ;;
+    AADSTS700223 | AADSTS700238)
+      echo "  Hint: the tenant does not allow workload identity federation for this identity. Ask your Entra ID admin." ;;
+    AADSTS90002)
+      echo "  Hint: tenant $cfg_tenant_id does not exist. Check azure.tenant_id in the deployment config." ;;
+  esac
 }
 
 # Print which platform runs this script: gitlab, github or local.
@@ -322,137 +407,266 @@ ci_platform() {
   fi
 }
 
-# Get AWS credentials ready for OpenTofu. The mode depends on the platform,
-# not on which AWS variables happen to be set.
+# Unset every variable that could make the azurerm provider or backend use
+# another credential than the CI job's OIDC token. Both prefer a storage key,
+# a SAS token, a client certificate or a client secret over OIDC. A group or
+# instance CI/CD variable (or a runner setting) could otherwise run OpenTofu
+# as some other identity. Warn when any of them was set.
+#   $@: more variable names to unset
+clear_other_azure_credentials() {
+  local var dropped=()
+  for var in \
+    ARM_ACCESS_KEY ARM_SAS_TOKEN \
+    ARM_CLIENT_SECRET ARM_CLIENT_SECRET_FILE_PATH \
+    ARM_CLIENT_CERTIFICATE ARM_CLIENT_CERTIFICATE_PATH ARM_CLIENT_CERTIFICATE_PASSWORD \
+    ARM_CLIENT_ID_FILE_PATH \
+    ARM_ADO_PIPELINE_SERVICE_CONNECTION_ID ARM_OIDC_AZURE_SERVICE_CONNECTION_ID AZURESUBSCRIPTION_SERVICE_CONNECTION_ID \
+    ARM_USE_MSI ARM_MSI_ENDPOINT ARM_USE_AKS_WORKLOAD_IDENTITY \
+    ARM_OIDC_TOKEN_FILE_PATH AZURE_FEDERATED_TOKEN_FILE \
+    ARM_ENVIRONMENT ARM_METADATA_HOST ARM_METADATA_HOSTNAME \
+    "$@"; do
+    if [[ -n "${!var:-}" ]]; then
+      dropped+=("$var")
+    fi
+    unset "$var"
+  done
+  if ((${#dropped[@]} > 0)); then
+    printf "${YELLOW}%s${RESET}\n" "WARNING: This job has ${dropped[*]} set, maybe by a group, organization or instance CI/CD variable. tf.sh unsets them and uses the job's OIDC token for ci.azure_client_id." >&2
+  fi
+  # The Azure CLI login is on by default. Turn it off, so OpenTofu cannot
+  # quietly use a stray az login on the runner. This is safe because
+  # providers.tf sets subscription_id.
+  export ARM_USE_CLI=false
+}
+
+# Get Azure credentials ready for OpenTofu. The mode depends on the platform,
+# not on which Azure variables happen to be set.
 #
 # - GitLab CI: GitLab makes a JWT (JSON Web Token) for each job in
-#   GITLAB_OIDC_TOKEN. This writes it to AWS_WEB_IDENTITY_TOKEN_FILE and
-#   exports AWS_ROLE_ARN. The AWS SDK then trades the token for role
-#   credentials. Static keys and AWS_PROFILE are unset first, because the SDK
-#   prefers them over the token. A group or instance CI/CD variable could
-#   otherwise run OpenTofu as some other identity.
-# - GitHub Actions: aws-actions/configure-aws-credentials runs before this
-#   script and sets AWS_ACCESS_KEY_ID.
-# - Your machine: the normal AWS credential chain (AWS_PROFILE, SSO, ...).
+#   GITLAB_OIDC_TOKEN. This exports it as ARM_OIDC_TOKEN. The azurerm
+#   provider and backend trade it with Entra ID for tokens of the identity
+#   ci.azure_client_id.
+# - GitHub Actions: GitHub sets ACTIONS_ID_TOKEN_REQUEST_URL and
+#   ACTIONS_ID_TOKEN_REQUEST_TOKEN when the job has "id-token: write". The
+#   azurerm provider and backend read them and ask GitHub for a new OIDC
+#   token each time they need a new Entra ID token. So long jobs work, and
+#   no azure/login step is needed.
+# - Your machine: your Azure CLI login (the azurerm default).
 #
-# Then check_identity makes sure the credentials belong to the right role.
+# The backend file has use_azuread_auth = true, so the backend uses the same
+# Entra ID login for the state blob. No storage keys are used.
+#
+# Then check_identity makes sure the login works for the right identity.
 setup_auth() {
   local mode
   mode="$(ci_platform)"
   case "$mode" in
     gitlab)
       if [[ -z "${GITLAB_OIDC_TOKEN:-}" ]]; then
-        error "GITLAB_OIDC_TOKEN is empty, so there are no AWS credentials."
+        error "GITLAB_OIDC_TOKEN is empty, so there are no Azure credentials."
         echo "  id_tokens is declared under default: in .ci/templates/tf-templates.yml. Check whether your pipeline overrides default: and drops it." >&2
         exit 1
       fi
-      local var dropped=()
-      for var in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE; do
-        if [[ -n "${!var:-}" ]]; then
-          dropped+=("$var")
-        fi
-        unset "$var"
-      done
-      if ((${#dropped[@]} > 0)); then
-        printf "${YELLOW}%s${RESET}\n" "WARNING: This job has ${dropped[*]} set, maybe by a group or instance CI/CD variable. tf.sh unsets them and uses the GitLab OIDC token for ci.aws_role_arn." >&2
-      fi
-
-      export AWS_WEB_IDENTITY_TOKEN_FILE="${AWS_WEB_IDENTITY_TOKEN_FILE:-${TMPDIR:-/tmp}/gitlab-oidc-${CI_JOB_ID:-$$}.jwt}"
-      export AWS_ROLE_ARN="$cfg_role_arn"
-      # The SDK reads the file again when it renews credentials, so delete
-      # it only when tf.sh exits, after OpenTofu is done.
-      trap 'rm -f -- "$AWS_WEB_IDENTITY_TOKEN_FILE"' EXIT
-      (
-        umask 077
-        printf '%s\n' "$GITLAB_OIDC_TOKEN" >"$AWS_WEB_IDENTITY_TOKEN_FILE"
-      )
-      chmod 600 "$AWS_WEB_IDENTITY_TOKEN_FILE"
-      echo "Wrote the GitLab OIDC token to $AWS_WEB_IDENTITY_TOKEN_FILE. Role: $AWS_ROLE_ARN"
+      # ARM_OIDC_REQUEST_* do no harm here (a direct token wins), but unset
+      # them too, so the setup is the same on both platforms.
+      clear_other_azure_credentials ARM_OIDC_REQUEST_URL ARM_OIDC_REQUEST_TOKEN
+      export ARM_USE_OIDC=true
+      export ARM_CLIENT_ID="$cfg_client_id"
+      export ARM_OIDC_TOKEN="$GITLAB_OIDC_TOKEN"
+      echo "Using the GitLab OIDC token for client ID $ARM_CLIENT_ID in tenant $ARM_TENANT_ID."
       ;;
     github)
-      if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
-        error "No AWS credentials found."
-        echo "  Run aws-actions/configure-aws-credentials before this step. On pull requests from forks, GitHub gives no OIDC token, so only the validate and setup jobs run." >&2
+      if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]]; then
+        error "GitHub gave this job no OIDC token, so there are no Azure credentials."
+        echo "  The job needs 'permissions: id-token: write'. On pull requests from forks, GitHub gives no OIDC token, so only the validate and setup jobs run." >&2
         exit 1
       fi
-      echo "Using the AWS credentials from aws-actions/configure-aws-credentials."
+      # A direct token (ARM_OIDC_TOKEN) wins over the GitHub request URL,
+      # and ARM_OIDC_REQUEST_* win over ACTIONS_ID_TOKEN_REQUEST_*.
+      clear_other_azure_credentials ARM_OIDC_TOKEN ARM_OIDC_REQUEST_URL ARM_OIDC_REQUEST_TOKEN
+      export ARM_USE_OIDC=true
+      export ARM_CLIENT_ID="$cfg_client_id"
+      echo "Using GitHub OIDC tokens for client ID $ARM_CLIENT_ID in tenant $ARM_TENANT_ID."
       ;;
     local)
-      echo "Not in CI. Using your AWS credential chain (AWS_PROFILE=${AWS_PROFILE:-<not set>})."
+      echo "Not in CI. Using your Azure CLI login."
+      # The provider and backend prefer these over the az login.
+      local var
+      for var in ARM_ACCESS_KEY ARM_SAS_TOKEN; do
+        if [[ -n "${!var:-}" ]]; then
+          echo "NOTE: $var is set. OpenTofu uses it for the state backend instead of your Azure CLI login." >&2
+        fi
+      done
+      for var in ARM_CLIENT_SECRET ARM_CLIENT_SECRET_FILE_PATH ARM_CLIENT_CERTIFICATE ARM_CLIENT_CERTIFICATE_PATH ARM_CLIENT_CERTIFICATE_PASSWORD ARM_OIDC_TOKEN ARM_OIDC_TOKEN_FILE_PATH; do
+        if [[ -n "${!var:-}" ]]; then
+          echo "NOTE: $var is set. If ARM_CLIENT_ID is also set, OpenTofu uses it instead of your Azure CLI login." >&2
+        fi
+      done
+      for var in ARM_USE_MSI ARM_USE_AKS_WORKLOAD_IDENTITY; do
+        if [[ "${!var:-}" == true ]]; then
+          echo "NOTE: $var is true. OpenTofu may use that identity instead of your Azure CLI login." >&2
+        fi
+      done
+      if [[ "${ARM_USE_CLI:-}" == false ]]; then
+        echo "NOTE: ARM_USE_CLI is false, so OpenTofu does not use your Azure CLI login." >&2
+      fi
       ;;
   esac
 
   check_identity "$mode"
 }
 
-# Check that the AWS credentials belong to ci.aws_role_arn.
+# Check that the Azure login works for the right identity.
 #   $1: auth mode (gitlab, github or local)
-# In CI the caller must be arn:<partition>:sts::<account>:assumed-role/<role
-# name>/<session>, with the account and role name of ci.aws_role_arn. On your
-# own machine only the account must match, because you may use another role
-# or an SSO session.
 check_identity() {
+  local mode="$1"
+  if [[ "$mode" == local ]]; then
+    check_identity_local
+  else
+    check_identity_ci "$mode"
+  fi
+}
+
+# In CI, do what OpenTofu will do, but with clear errors: trade the job's
+# OIDC token for an Entra ID access token for ci.azure_client_id, check
+# whose token it is, and read azure.subscription_id with it.
+#   $1: auth mode (gitlab or github)
+check_identity_ci() {
   local mode="$1" verbose=true
   [[ "${PRINT_OIDC_CLAIMS:-true}" == "true" ]] || verbose=false
+  require_cmd curl "CI jobs need it to check the Azure login."
+  require_cmd jq "CI jobs need it to check the Azure login."
 
-  if [[ "$mode" == local && "$verbose" != true ]]; then
-    echo "NOTE: PRINT_OIDC_CLAIMS is false. Skipping the AWS identity check."
-    return 0
+  local oidc_token resp code body
+  case "$mode" in
+    gitlab) oidc_token="$GITLAB_OIDC_TOKEN" ;;
+    github)
+      # The response is JSON: {"value": "<token>"}.
+      if ! resp="$(printf 'Authorization: bearer %s\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" |
+        curl -sS --max-time 60 -H @- -w '\n%{http_code}' \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$OIDC_TOKEN_AUDIENCE")"; then
+        fail "Could not reach GitHub to get an OIDC token. See the curl error above."
+      fi
+      code="${resp##*$'\n'}"
+      body="${resp%$'\n'*}"
+      oidc_token="$(jq -r '.value // empty' <<<"$body" 2>/dev/null || true)"
+      if [[ "$code" != 200 || -z "$oidc_token" ]]; then
+        fail "GitHub did not give an OIDC token (HTTP $code). Check that the job has 'permissions: id-token: write'."
+      fi
+      ;;
+  esac
+
+  # Client credentials grant with the OIDC token as the client assertion.
+  if ! resp="$(printf '%s' "$oidc_token" |
+    curl -sS --max-time 60 -w '\n%{http_code}' \
+      --data-urlencode "grant_type=client_credentials" \
+      --data-urlencode "client_id=$cfg_client_id" \
+      --data-urlencode "scope=$ARM_URL/.default" \
+      --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+      --data-urlencode "client_assertion@-" \
+      "$ENTRA_LOGIN_URL/$cfg_tenant_id/oauth2/v2.0/token")"; then
+    fail "Could not reach Entra ID ($ENTRA_LOGIN_URL). See the curl error above."
   fi
-  if ! command -v aws >/dev/null 2>&1; then
-    if [[ "$mode" == local ]]; then
-      echo "NOTE: The 'aws' CLI is not installed. Skipping the AWS identity check. Make sure your credentials are for account $(cut -d: -f5 <<<"$cfg_role_arn")." >&2
-      return 0
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  local access_token
+  access_token="$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)"
+  if [[ "$code" != 200 || -z "$access_token" ]]; then
+    local err desc
+    err="$(jq -r '.error // empty' <<<"$body" 2>/dev/null || true)"
+    desc="$(jq -r '.error_description // empty' <<<"$body" 2>/dev/null || true)"
+    error "Entra ID did not accept the $mode OIDC token for ci.azure_client_id $cfg_client_id in tenant $cfg_tenant_id (HTTP $code)."
+    echo "  ${err:-unknown error}: ${desc:-no error description}" >&2
+    aadsts_hint "$desc" >&2
+    if [[ "$verbose" == true ]]; then
+      print_oidc_claims "$mode" "$oidc_token"
+    else
+      echo "  Set PRINT_OIDC_CLAIMS to \"true\" to see the OIDC token claims." >&2
     fi
-    fail "The 'aws' CLI is not installed or not on PATH. CI jobs need it to check that they run as ci.aws_role_arn ($cfg_role_arn)."
-  fi
-
-  local caller
-  if ! caller="$(AWS_PAGER="" aws sts get-caller-identity --query Arn --output text)"; then
-    case "$mode" in
-      gitlab)
-        error "AssumeRoleWithWebIdentity failed for $cfg_role_arn."
-        if [[ "$verbose" == true ]]; then
-          print_gitlab_claims
-        else
-          echo "  Set PRINT_OIDC_CLAIMS to \"true\" to see the JWT claims." >&2
-        fi
-        ;;
-      github)
-        error "The AWS credentials in this job do not work (sts get-caller-identity failed). Check the role trust policy and the configure-aws-credentials step."
-        ;;
-      local)
-        error "Your AWS credentials do not work (sts get-caller-identity failed). Set AWS_PROFILE, or run 'aws sso login'."
-        ;;
-    esac
     exit 1
   fi
-  local want_partition want_account want_role
-  want_partition="$(cut -d: -f2 <<<"$cfg_role_arn")"
-  want_account="$(cut -d: -f5 <<<"$cfg_role_arn")"
-  # A role ARN can have a path (role/team/ci). The role name is the last part.
-  want_role="${cfg_role_arn##*/}"
 
-  local caller_partition caller_account caller_kind caller_role=""
-  caller_partition="$(cut -d: -f2 <<<"$caller")"
-  caller_account="$(cut -d: -f5 <<<"$caller")"
-  caller_kind="$(cut -d: -f6 <<<"$caller" | cut -d/ -f1)"
-  if [[ "$caller" =~ ^arn:[a-z-]+:sts::[0-9]{12}:assumed-role/([^/]+)/ ]]; then
-    caller_role="${BASH_REMATCH[1]}"
+  # Check the tenant and client in the access token. Microsoft says to treat
+  # its access tokens as opaque, so only warn when this one does not decode.
+  local claims tid appid
+  if claims="$(printf '%s' "$access_token" | jwt_claims)"; then
+    tid="$(jq -r '.tid // empty' <<<"$claims")"
+    # v1 tokens (ARM issues these) have appid. v2 tokens have azp.
+    appid="$(jq -r '.appid // .azp // empty' <<<"$claims")"
+    if [[ "${tid,,}" != "${cfg_tenant_id,,}" ]]; then
+      fail "The Azure access token is for tenant '$tid', but azure.tenant_id is $cfg_tenant_id. tf.sh stops before OpenTofu touches the wrong tenant."
+    fi
+    if [[ "${appid,,}" != "${cfg_client_id,,}" ]]; then
+      fail "The Azure access token is for client ID '$appid', but ci.azure_client_id is $cfg_client_id. CI must run as that identity."
+    fi
+  else
+    printf "${YELLOW}%s${RESET}\n" "WARNING: Could not decode the Azure access token, so tf.sh cannot check its tenant and client ID. It goes on and checks the subscription." >&2
   fi
 
-  if [[ "$caller_partition" != "$want_partition" || "$caller_account" != "$want_account" ]]; then
-    fail "AWS credentials are for '$caller', but ci.aws_role_arn is $cfg_role_arn. The account or partition does not match, so tf.sh stops before OpenTofu touches the wrong account."
+  if ! resp="$(printf 'Authorization: Bearer %s\n' "$access_token" |
+    curl -sS --max-time 60 -H @- -w '\n%{http_code}' \
+      "$ARM_URL/subscriptions/$cfg_subscription_id?api-version=2022-12-01")"; then
+    fail "Could not reach Azure Resource Manager ($ARM_URL). See the curl error above."
   fi
-  if [[ "$caller_kind" == assumed-role && "$caller_role" == "$want_role" ]]; then
-    echo "AWS identity check PASSED: $caller"
+  code="${resp##*$'\n'}"
+  body="${resp%$'\n'*}"
+  if [[ "$code" != 200 ]]; then
+    local arm_err
+    arm_err="$(jq -r '"\(.error.code // "unknown error"): \(.error.message // "no error message")"' <<<"$body" 2>/dev/null || echo "unknown error")"
+    error "The identity ci.azure_client_id $cfg_client_id cannot read subscription $cfg_subscription_id (HTTP $code)."
+    echo "  $arm_err" >&2
+    echo "  Check azure.subscription_id, and give the identity a role on that subscription (for example Contributor). A new role assignment can take up to about 10 minutes to work." >&2
+    exit 1
+  fi
+  local sub_name sub_state
+  sub_name="$(jq -r '.displayName // ""' <<<"$body")"
+  sub_state="$(jq -r '.state // ""' <<<"$body")"
+  if [[ -n "$sub_state" && "$sub_state" != Enabled ]]; then
+    printf "${YELLOW}%s${RESET}\n" "WARNING: Subscription $cfg_subscription_id is in state '$sub_state', not Enabled. Changes may fail." >&2
+  fi
+  echo "Azure identity check PASSED: client ID $cfg_client_id in tenant $cfg_tenant_id can read subscription '$sub_name' ($cfg_subscription_id)."
+}
+
+# On your own machine, check the Azure CLI login: it must see
+# azure.subscription_id, and that subscription must be in azure.tenant_id.
+# OpenTofu uses azure.subscription_id from the config even when your az
+# default subscription is another one.
+check_identity_local() {
+  if [[ "${PRINT_OIDC_CLAIMS:-true}" != "true" ]]; then
+    echo "NOTE: PRINT_OIDC_CLAIMS is false. Skipping the Azure identity check."
     return 0
   fi
-  if [[ "$mode" == local ]]; then
-    printf "${YELLOW}%s${RESET}\n" "WARNING: You run as '$caller', not as the CI role $cfg_role_arn. The account matches, so tf.sh goes on. CI may have different permissions." >&2
+  if ! command -v az >/dev/null 2>&1; then
+    echo "NOTE: The 'az' CLI is not installed. Skipping the Azure identity check. Make sure your credentials are for tenant $cfg_tenant_id and can use subscription $cfg_subscription_id." >&2
     return 0
   fi
-  fail "AWS credentials are for '$caller', but ci.aws_role_arn is $cfg_role_arn. CI must run as that role. Check the role ARN in the deployment config and in the CI setup."
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "NOTE: 'jq' is not installed. Skipping the Azure identity check." >&2
+    return 0
+  fi
+
+  local current
+  if ! current="$(az account show -o json)"; then
+    fail "Your Azure CLI login does not work ('az account show' failed). Run 'az login --tenant $cfg_tenant_id'."
+  fi
+  local sub
+  if ! sub="$(az account show --subscription "$cfg_subscription_id" -o json 2>/dev/null)"; then
+    fail "Your Azure CLI login cannot see subscription $cfg_subscription_id (azure.subscription_id). Run 'az login --tenant $cfg_tenant_id', or check the ID in the deployment config."
+  fi
+
+  local sub_tenant sub_name user current_id
+  sub_tenant="$(jq -r '.tenantId // ""' <<<"$sub")"
+  sub_name="$(jq -r '.name // ""' <<<"$sub")"
+  user="$(jq -r '"\(.user.name // "unknown") (\(.user.type // "unknown"))"' <<<"$sub")"
+  current_id="$(jq -r '.id // ""' <<<"$current")"
+  if [[ "${sub_tenant,,}" != "${cfg_tenant_id,,}" ]]; then
+    fail "Subscription $cfg_subscription_id is in tenant '$sub_tenant', but azure.tenant_id is $cfg_tenant_id. Fix the deployment config."
+  fi
+  if [[ "${current_id,,}" != "${cfg_subscription_id,,}" ]]; then
+    echo "NOTE: Your az default subscription is $current_id. OpenTofu uses $cfg_subscription_id from the config (ARM_SUBSCRIPTION_ID)." >&2
+  fi
+  echo "Azure identity check PASSED: $user can see subscription '$sub_name' ($cfg_subscription_id) in tenant $cfg_tenant_id."
+  echo "NOTE: You run as yourself, not as the CI identity $cfg_client_id. CI may have different permissions." >&2
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -462,23 +676,24 @@ check_identity() {
 # deployments/.
 #   $@: extra init flags
 #
-# A plain init reads the state of the default workspace. With
-# workspace_key_prefix, that state is at the bucket root, outside the
-# deployment's prefix. A CI role that may read only its own prefix gets
-# 403 Forbidden there. So init goes straight to the deployment's workspace
-# with TF_WORKSPACE, and reads only that workspace's state.
+# The azurerm backend keeps the default workspace's state in the blob named
+# by key (terraform.tfstate) and workspace <ws> in the blob "<key>env:<ws>",
+# in the same container. A plain init reads the default workspace's blob,
+# which this project never uses. So init goes straight to the deployment's
+# workspace with TF_WORKSPACE, and reads only that workspace's blob.
 #
-# When the prefix has no workspaces yet, init with TF_WORKSPACE creates the
-# workspace. When other workspaces exist, it fails for a missing one. Only
-# then does this fall back to a plain init and `workspace select -or-create`.
-# That fallback needs read access to the bucket root. See "State access" in
-# README.md.
+# When the container has no workspaces yet, init with TF_WORKSPACE creates
+# the workspace. When other workspaces exist, it fails for a missing one.
+# Only then does this fall back to a plain init and
+# `workspace select -or-create`. Both ways need the role Storage Blob Data
+# Contributor on the state container. The simple setup is one container per
+# deployment. See "State access" in README.md.
 tf_init_workspace() {
   cd "$DEPLOYMENTS_DIR"
   local init_log
   init_log="$(mktemp)"
-  echo "Running $TF_BIN init with $DEPLOYMENT.s3.tfbackend (workspace $DEPLOYMENT_WORKSPACE)"
-  if TF_WORKSPACE="$DEPLOYMENT_WORKSPACE" "$TF_BIN" init -input=false -backend-config="backends/$DEPLOYMENT.s3.tfbackend" -reconfigure "$@" 2>&1 | tee "$init_log"; then
+  echo "Running $TF_BIN init with $DEPLOYMENT.azurerm.tfbackend (workspace $DEPLOYMENT_WORKSPACE)"
+  if TF_WORKSPACE="$DEPLOYMENT_WORKSPACE" "$TF_BIN" init -input=false -backend-config="backends/$DEPLOYMENT.azurerm.tfbackend" -reconfigure "$@" 2>&1 | tee "$init_log"; then
     rm -f -- "$init_log"
     echo "Selecting $TF_BIN workspace $DEPLOYMENT_WORKSPACE"
     "$TF_BIN" workspace select "$DEPLOYMENT_WORKSPACE"
@@ -491,9 +706,9 @@ tf_init_workspace() {
   rm -f -- "$init_log"
 
   echo "Workspace $DEPLOYMENT_WORKSPACE does not exist yet. Creating it."
-  if ! "$TF_BIN" init -input=false -backend-config="backends/$DEPLOYMENT.s3.tfbackend" -reconfigure "$@" \
+  if ! "$TF_BIN" init -input=false -backend-config="backends/$DEPLOYMENT.azurerm.tfbackend" -reconfigure "$@" \
     || ! "$TF_BIN" workspace select -or-create "$DEPLOYMENT_WORKSPACE"; then
-    fail "Could not create workspace $DEPLOYMENT_WORKSPACE. If the CI role may use only its own prefix of the state bucket, it cannot create a workspace. Create it once with wider credentials (for example 'task switch' on your machine), then run this job again. See \"State access\" in README.md."
+    fail "Could not create workspace $DEPLOYMENT_WORKSPACE. The identity needs the role Storage Blob Data Contributor on the state container in deployments/backends/$DEPLOYMENT.azurerm.tfbackend. If it may not create blobs there, create the workspace once with wider rights (for example 'task switch' on your machine), then run this job again. See \"State access\" in README.md."
   fi
 }
 
@@ -693,10 +908,12 @@ cmd_destroy() {
 }
 
 # Print one line per tier in GITHUB_OUTPUT format, for example:
-#   develop=[{"deployment":"develop-a1b2c3d4","region":"us-east-1","role_arn":"arn:aws:iam::123456789012:role/ci-my-repo-deploy"}]
+#   develop=[{"deployment":"develop-a1b2c3d4"}]
 #   stage=[]
-# GitHub Actions uses each line as the matrix for that tier's jobs. Every
-# config is checked first. If any config is bad, nothing goes to stdout.
+# GitHub Actions uses each line as the matrix for that tier's jobs. Each
+# entry has only the deployment name. tf.sh reads the rest from the config
+# in every job. Every config is checked first. If any config is bad,
+# nothing goes to stdout.
 # When ONLY_DEPLOYMENT is set, only that config is read and checked, and it
 # is the only entry in the output.
 cmd_matrix() {
@@ -748,9 +965,8 @@ cmd_matrix() {
     fi
 
     # yq builds the JSON so that quotes and other special characters are
-    # escaped correctly. validate_config has checked that region and role_arn
-    # are set and that role_arn is an ARN, so both are plain strings.
-    obj="$(NAME="$name" yq -o=json -I=0 '{"deployment": strenv(NAME), "region": .aws.region, "role_arn": .ci.aws_role_arn}' "$file")"
+    # escaped correctly.
+    obj="$(NAME="$name" yq -n -o=json -I=0 '{"deployment": strenv(NAME)}')"
     if [[ -n "${tier_json[$cfg_env]}" ]]; then
       tier_json[$cfg_env]+=",$obj"
     else

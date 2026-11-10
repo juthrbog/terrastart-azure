@@ -3,12 +3,13 @@
 # The jobs in .ci/configs/ extend the `.validate`, `.plan`, `.apply`,
 # `.destroy-plan` and `.destroy` templates defined here.
 #
-# AWS auth is OIDC (OpenID Connect): GitLab mints a JWT (JSON Web Token) per
-# job, .ci/scripts/tf.sh writes it to disk, and the AWS SDK credential chain
-# exchanges it for role credentials. Each deployment job sets only DEPLOYMENT.
-# tf.sh reads the role ARN from ci.aws_role_arn in
+# Azure auth is OIDC (OpenID Connect) workload identity federation: GitLab
+# mints a JWT (JSON Web Token) per job, .ci/scripts/tf.sh passes it to
+# OpenTofu in ARM_OIDC_TOKEN, and the azurerm provider and backend exchange it
+# with Entra ID for an access token. Each deployment job sets only DEPLOYMENT.
+# tf.sh reads the client ID of the CI identity from ci.azure_client_id in
 # deployments/configs/$DEPLOYMENT.yaml. CI authenticates with OIDC only.
-# Static AWS access keys are not used.
+# Client secrets, certificates and storage account keys are not used.
 
 default:
   # No pull_policy here. Some runners allow only if-not-present, and a job
@@ -16,15 +17,16 @@ default:
   # the runner's default policy is enough.
   image:
     name: $TF_IMAGE
-  # Set this to the tag of the runners that can reach your state bucket and
-  # target accounts. Remove the block entirely to use any available runner.
+  # Set this to the tag of the runners that can reach your state storage
+  # account and target subscriptions. Remove the block entirely to use any
+  # available runner.
   # tags:
   #   - <runner-tag>
   # Do not set `interruptible` here. It is set per template below, so a new
   # commit can never cancel a running apply or destroy.
   # OIDC setup: .ci/scripts/tf.sh reads GITLAB_OIDC_TOKEN. Declaring
   # id_tokens here covers every job. If a project overrides `default:` and drops
-  # this key, GITLAB_OIDC_TOKEN is empty, and tf.sh stops every AWS-touching
+  # this key, GITLAB_OIDC_TOKEN is empty, and tf.sh stops every Azure-touching
   # job with an auth error.
   id_tokens:
     GITLAB_OIDC_TOKEN:
@@ -52,24 +54,33 @@ variables:
   # .github/actions/setup-tools/action.yml. Point this at
   # another registry if your runners pull from somewhere else.
   TF_IMAGE: $CI_REGISTRY_IMAGE/tofu:1.13.1
-  # OIDC token audience. Must match the `aud` condition on the IAM OIDC
-  # provider in every target AWS account. The default is the URL of this
-  # GitLab instance, for example https://gitlab.com. On a self-managed
-  # instance it is your own GitLab URL. Use that URL for the IAM OIDC
-  # provider too.
-  OIDC_AUDIENCE: $CI_SERVER_URL
-  # tf.sh always runs `aws sts get-caller-identity` at the start of each
-  # AWS-touching job and checks that the caller is the role in ci.aws_role_arn.
-  # If that check fails, "true" also prints the claims in the GitLab JWT, so
-  # you can compare them with the role trust policy. "false" hides the claims.
+  # OIDC token audience. Must match the audience of the federated identity
+  # credential on every CI identity. api://AzureADTokenExchange is the value
+  # Microsoft recommends and the default of
+  # `az identity federated-credential create`. Change it only if you also
+  # change it on every federated credential.
+  OIDC_AUDIENCE: api://AzureADTokenExchange
+  # At the start of each Azure-touching job, tf.sh exchanges the GitLab JWT
+  # for an Azure access token. It checks that the token belongs to the client
+  # ID in ci.azure_client_id and the tenant in azure.tenant_id, and that the
+  # identity can read azure.subscription_id. If the exchange fails, "true"
+  # also prints the claims in the GitLab JWT (never the token itself), so you
+  # can compare them with the federated credential. "false" hides the claims.
   # In CI it never skips the identity check.
+  #
+  # The federated credential must match these JWT claims exactly:
+  #   - issuer: $CI_SERVER_URL, for example https://gitlab.com
+  #   - subject: project_path:<group>/<project>:ref_type:branch:ref:<branch>
+  #     In MR pipelines, <branch> is the source branch.
+  #   - audience: OIDC_AUDIENCE above
+  # See "GitLab OIDC" in README.md.
   PRINT_OIDC_CLAIMS: "true"
-  # tf.sh writes the JWT to a per-job file, sets AWS_WEB_IDENTITY_TOKEN_FILE to
-  # it, and deletes it when the job ends. The AWS SDK credential chain reads
-  # that file. tf.sh also exports AWS_ROLE_ARN (from ci.aws_role_arn) and
-  # AWS_REGION and AWS_DEFAULT_REGION (from aws.region) from the deployment
-  # config.
-  AWS_ROLE_SESSION_NAME: gl-$CI_PROJECT_ID-$CI_PIPELINE_ID-$CI_JOB_ID
+  # tf.sh exports ARM_USE_OIDC=true, ARM_OIDC_TOKEN (from GITLAB_OIDC_TOKEN),
+  # ARM_CLIENT_ID (from ci.azure_client_id), ARM_TENANT_ID and
+  # ARM_SUBSCRIPTION_ID (from the azure block of the deployment config). It
+  # also exports ARM_USE_CLI=false, so OpenTofu never falls back to an Azure
+  # CLI login. Do not set other ARM_* credential variables in CI/CD settings:
+  # tf.sh unsets them.
 
 # Every job runs one command of .ci/scripts/tf.sh. The same script runs on
 # GitHub Actions, so both platforms run the same OpenTofu steps. tf.sh reads
@@ -81,7 +92,7 @@ variables:
 # Auth runs inside tf.sh, as the first step of `script`, not in a
 # `before_script`.
 #
-# resource_group: $DEPLOYMENT makes GitLab run at most one AWS-touching job
+# resource_group: $DEPLOYMENT makes GitLab run at most one Azure-touching job
 # per deployment at a time, across all pipelines. This stops two pipelines
 # from changing the same state at once. GitLab expands CI/CD
 # variables in resource_group, so one template line covers every deployment.

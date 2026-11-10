@@ -14,6 +14,17 @@ variable "config" {
   type        = any
 }
 
+# Azure variables
+variable "location" {
+  description = "The Azure region for the resources, e.g. eastus. It is the value of 'azure.location' in the yaml config in deployments/configs/. Set `location = var.location` on every resource that needs a region."
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags for the resources in the deployment, built in deployments/main.tf. The azurerm provider has no default tags, so set `tags = var.tags` on every resource that supports tags."
+  type        = map(string)
+}
+
 # Metadata variables, used for tagging and naming inside modules.
 variable "env" {
   description = "Env value passed in from the yaml config in deployments/configs/."

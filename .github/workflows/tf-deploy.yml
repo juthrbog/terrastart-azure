@@ -3,7 +3,8 @@
 # terraform.yml calls this workflow once per tier and step, for example
 # "plan the develop tier" or "apply the prod tier". It is not meant to run on
 # its own. All the OpenTofu logic is in .ci/scripts/tf.sh; this file only
-# sets up the runner, gets AWS credentials, and moves plan files between jobs.
+# sets up the runner, lets the job ask for an OIDC token, and moves plan
+# files between jobs.
 #
 # Each deployment in the tier gets its own job (a matrix job). The deployments
 # run in parallel, and one failure does not stop the others (fail-fast: false).
@@ -22,10 +23,11 @@ on:
         type: string
       deployments:
         description: >-
-          JSON array of {"deployment", "region", "role_arn"} objects, one per
-          deployment. This is one tier's line from `tf.sh matrix`, or the
-          "changed" output of the plan call for apply. It must not be empty
-          ("[]"); the caller skips the call in that case.
+          JSON array of {"deployment"} objects, one per deployment, for
+          example [{"deployment":"develop-a1b2c3d4"}]. tf.sh reads the rest
+          from the deployment's config. This is one tier's line from
+          `tf.sh matrix`, or the "changed" output of the plan call for apply.
+          It must not be empty ("[]"); the caller skips the call in that case.
         required: true
         type: string
       environment:
@@ -33,26 +35,20 @@ on:
           GitHub Environment for the job, for example prod or destroy. An
           empty string means no environment. Apply and destroy use an
           environment so that its protection rules (required reviewers,
-          allowed branches) apply. Plan and destroy-plan do not.
+          allowed branches) apply. Plan and destroy-plan do not. The
+          environment also changes the OIDC subject that Azure sees (see
+          the run job below).
         required: false
         type: string
         default: ""
-      role-duration-seconds:
-        description: >-
-          How long the AWS credentials last, in seconds. The setup job in
-          terraform.yml reads it from the AWS_ROLE_DURATION_SECONDS
-          repository variable.
-        required: false
-        type: number
-        default: 3600
       timeout-minutes:
         description: >-
-          Job time limit in minutes. It must be shorter than
-          role-duration-seconds, so that a slow job stops before its AWS
-          credentials expire. The setup job in terraform.yml works it out.
+          Job time limit in minutes. The setup job in terraform.yml reads it
+          from the TF_TIMEOUT_MINUTES repository variable (default 60,
+          allowed 1 to 360).
         required: false
         type: number
-        default: 55
+        default: 60
     outputs:
       changed:
         description: >-
@@ -75,10 +71,9 @@ jobs:
     name: ${{ inputs.command }} ${{ matrix.deployment }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
-    # The AWS credentials below last role-duration-seconds and do not renew.
-    # Stop the job a few minutes before that, so it does not lose access to
-    # AWS in the middle of a state write. Time spent waiting for approval or
-    # in the concurrency queue does not count.
+    # Stops a stuck job. Azure tokens do not limit the job length: the
+    # azurerm provider and backend get new ones when they need them. Time
+    # spent waiting for approval or in the concurrency queue does not count.
     timeout-minutes: ${{ inputs.timeout-minutes }}
     # One job at a time per deployment, across all runs of this repo. This
     # stops two runs from changing the same state at once. A job
@@ -92,7 +87,9 @@ jobs:
       cancel-in-progress: false
     permissions:
       contents: read
-      # Lets configure-aws-credentials ask GitHub for an OIDC token.
+      # Lets OpenTofu ask GitHub for OIDC tokens. With this, GitHub sets
+      # ACTIONS_ID_TOKEN_REQUEST_URL and ACTIONS_ID_TOKEN_REQUEST_TOKEN.
+      # tf.sh fails early if they are missing.
       id-token: write
     strategy:
       fail-fast: false
@@ -107,22 +104,6 @@ jobs:
       - name: Install OpenTofu and yq
         uses: ./.github/actions/setup-tools
 
-      # Trade the GitHub OIDC token for credentials of the deployment's role
-      # (ci.aws_role_arn in its config). The action exports
-      # AWS_ACCESS_KEY_ID and friends. tf.sh then checks that the caller
-      # identity is that role in that account, and fails if it is not.
-      #
-      # The role's MaxSessionDuration in IAM must be at least
-      # role-duration-seconds, or this step fails. See README.md
-      # ("AWS session length on GitHub").
-      - name: Get AWS credentials
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ matrix.role_arn }}
-          aws-region: ${{ matrix.region }}
-          role-session-name: gh-${{ github.run_id }}-${{ github.run_attempt }}
-          role-duration-seconds: ${{ inputs.role-duration-seconds }}
-
       # apply and destroy use the plan file that the plan job of the same run
       # saved. They never make a new plan, so they change exactly what the
       # plan showed. The artifact also holds the provider lock file from the
@@ -135,6 +116,25 @@ jobs:
           name: ${{ inputs.command == 'apply' && 'plan' || 'plan-destroy' }}-${{ matrix.deployment }}
           path: deployments
 
+      # There is no Azure login step. tf.sh reads the deployment's config
+      # and exports ARM_USE_OIDC=true, ARM_CLIENT_ID (ci.azure_client_id),
+      # ARM_TENANT_ID and ARM_SUBSCRIPTION_ID. OpenTofu's azurerm provider
+      # and backend then ask GitHub for a fresh OIDC token each time they
+      # need a new Azure token, and trade it for access as that identity.
+      # tf.sh first checks the trade itself and fails with a clear message
+      # if Azure says no.
+      #
+      # Azure accepts the token only if the identity has a federated
+      # credential whose subject matches exactly (case-sensitive). The
+      # subject this job sends:
+      #   - no environment (plan, destroy-plan):
+      #       repo:<owner>/<repo>:pull_request on a pull request
+      #       repo:<owner>/<repo>:ref:refs/heads/<branch> on a push or a
+      #       manual run
+      #   - with an environment (apply, destroy):
+      #       repo:<owner>/<repo>:environment:<environment>
+      # Newer repositories use repo:<owner>@<owner_id>/<repo>@<repo_id>:...
+      # See README.md ("GitHub OIDC").
       - name: Run tf.sh ${{ inputs.command }}
         env:
           COMMAND: ${{ inputs.command }}

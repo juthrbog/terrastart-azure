@@ -12,8 +12,8 @@
 # and terraform/versions.tf.
 # README.md ("Change a tool version") lists every place to change.
 #
-# The runner already has the other tools that tf.sh uses: bash, jq, git,
-# shellcheck and the AWS CLI.
+# The runner already has the other tools that tf.sh uses: bash, curl, jq,
+# git and shellcheck. tf.sh does not use the Azure CLI in CI.
 
 name: Set up tools
 description: Install the pinned OpenTofu and yq versions for tf.sh.

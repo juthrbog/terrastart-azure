@@ -1,0 +1,26 @@
+# Documents the required tfbackend structure and possible values.
+# Copy this file for each deployment you need and remove all comments.
+# Name the copy after its config file, in the format
+# <env>-<deployment_id>.azurerm.tfbackend.
+
+# tfstate blob will be:
+#  <storage_account_name>/<container_name>/<key>env:<tf_workspace_name>
+# e.g. terraform.tfstateenv:develop-1a2b3c4d. Use one container per
+# deployment, so each deployment's CI identity can only reach its own state.
+
+# The resource group of the state storage account. OpenTofu does not need it
+# when use_azuread_auth is true, but it shows where the account is.
+resource_group_name  = ""
+# The state storage account, e.g. <state-account-name>.
+storage_account_name = ""
+# The container for this deployment's state, e.g. tfstate-<deployment_id>.
+container_name       = ""
+key                  = "terraform.tfstate"
+# Sign in to the storage account with Entra ID, not with storage account
+# keys. The CI identity (and you) need the Storage Blob Data Contributor role
+# on the container. State locking uses a lease on the state blob.
+use_azuread_auth     = true
+# A state account in another subscription needs no extra setting: with
+# use_azuread_auth = true, OpenTofu finds the account by name. A state account
+# in another tenant does not work with a managed identity, because the
+# identity lives in one tenant.

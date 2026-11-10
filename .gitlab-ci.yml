@@ -52,8 +52,12 @@ variables:
 
 # Each deployment job sets only one variable, DEPLOYMENT. Its value is the
 # name of a config file in deployments/configs/ without ".yaml", for example
-# develop-a1b2c3d4. .ci/scripts/tf.sh reads env, deployment_id, aws.region
-# and ci.aws_role_arn from that file. ci.aws_role_arn must be a
-# real IAM role ARN whose trust policy allows the GitLab OIDC provider as a
-# Federated principal. Provision these per-deployment roles wherever you manage
-# IAM. See the job examples in .ci/configs/.
+# develop-a1b2c3d4. .ci/scripts/tf.sh reads env, deployment_id, the azure
+# block and ci.azure_client_id from that file. ci.azure_client_id is the client
+# ID of the CI identity for that deployment: a user-assigned managed identity
+# or an Entra app registration. Use one identity per deployment. Each identity
+# needs a federated identity credential that matches the subject GitLab sends:
+# project_path:<group>/<project>:ref_type:branch:ref:<branch>. The match is
+# exact, so add one for the default branch. MR plans from other branches need
+# their own credential (see "GitLab OIDC" in README.md). See the job examples in
+# .ci/configs/.
