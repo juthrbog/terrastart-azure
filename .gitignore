@@ -1,0 +1,20 @@
+# OpenTofu (and Terraform) working files
+.terraform/
+terraform.tfstate.d
+terraform.tfstate
+# Commit deployments/.terraform.lock.hcl, the provider lock file. Only
+# deployments/ is a root module, so ignore a lock file anywhere else.
+.terraform.lock.hcl
+!/deployments/.terraform.lock.hcl
+
+# Files that .ci/scripts/tf.sh writes in deployments/ for CI artifacts:
+#   <deployment>.out, <deployment>-destroy.out    plan files
+#   <deployment>.lock.hcl, <deployment>-destroy.lock.hcl
+#                                                 lock file copies
+#   <deployment>.changes                          change marker
+# In .gitignore, `*` also matches a leading dot, so the first pattern below
+# also matches .terraform.lock.hcl. The `!` line after it keeps that file.
+/deployments/*.lock.hcl
+!/deployments/.terraform.lock.hcl
+*.out
+*.changes

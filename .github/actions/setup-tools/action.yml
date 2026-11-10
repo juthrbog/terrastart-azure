@@ -1,0 +1,63 @@
+# Installs the tools that .ci/scripts/tf.sh needs on a GitHub runner.
+#
+# Every GitHub job that runs tf.sh uses this action, so the tool versions
+# live in one place for GitHub. Run actions/checkout first: GitHub reads a
+# local action from the checked-out repository.
+#
+# Keep these versions the same as the GitLab side: TOFU_VERSION, the
+# TOFU_SHA256_* hashes, YQ_VERSION and the YQ_SHA256_* hashes in
+# .ci/image/Dockerfile, and the image tag in TF_IMAGE in
+# .ci/templates/tf-templates.yml. Then both pipelines run the same tools. The
+# OpenTofu version must also meet required_version in deployments/versions.tf
+# and terraform/versions.tf.
+# README.md ("Change a tool version") lists every place to change.
+#
+# The runner already has the other tools that tf.sh uses: bash, jq, git,
+# shellcheck and the AWS CLI.
+
+name: Set up tools
+description: Install the pinned OpenTofu and yq versions for tf.sh.
+
+runs:
+  using: composite
+  steps:
+    - name: Install OpenTofu
+      uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+      with:
+        tofu_version: 1.13.1
+        # The wrapper adds extra text to tofu output. That text would end up
+        # in the plan summary that tf.sh writes, so turn it off.
+        tofu_wrapper: false
+        # The SHA256 hashes of the linux_amd64 and linux_arm64 zips, the same
+        # as TOFU_SHA256_* in .ci/image/Dockerfile. The action stops if the
+        # download matches neither.
+        checksums: |
+          8ccbc6f8ee21d2827715f3c6e08a9b3e0209b1e62057c05067ef117e047c1a80
+          b9614df40575cc3fc10a8a25025b7245d961da279f715ea3efff4ddae8e6938a
+
+    # The runner image has its own yq, but its version can change at any
+    # time. Download a fixed version and check its hash, like the Dockerfile
+    # does. The new directory goes first on PATH, so tf.sh uses this yq.
+    - name: Install yq
+      shell: bash
+      env:
+        YQ_VERSION: 4.54.1
+        YQ_SHA256_AMD64: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
+        YQ_SHA256_ARM64: 189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b
+      run: |
+        case "$RUNNER_OS/$RUNNER_ARCH" in
+          Linux/X64) arch=amd64; sha="$YQ_SHA256_AMD64" ;;
+          Linux/ARM64) arch=arm64; sha="$YQ_SHA256_ARM64" ;;
+          *)
+            echo "::error::No pinned yq for $RUNNER_OS/$RUNNER_ARCH. Use a Linux X64 or ARM64 runner."
+            exit 1
+            ;;
+        esac
+        bin_dir="$RUNNER_TEMP/setup-tools/bin"
+        mkdir -p "$bin_dir"
+        curl -fsSLo "$bin_dir/yq" \
+          "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${arch}"
+        echo "${sha}  $bin_dir/yq" | sha256sum -c -
+        chmod 0755 "$bin_dir/yq"
+        echo "$bin_dir" >>"$GITHUB_PATH"
+        "$bin_dir/yq" --version

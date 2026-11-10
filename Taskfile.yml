@@ -1,0 +1,250 @@
+# https://taskfile.dev
+
+version: "3"
+
+set: [pipefail]
+shopt: [globstar]
+
+vars:
+  # The OpenTofu command that the tasks run. To use Terraform instead, run
+  # `TF_BIN=terraform task <name>` or `task <name> TF_BIN=terraform`.
+  TF_BIN:
+    sh: echo "${TF_BIN:-tofu}"
+
+tasks:
+  # The tasks below do not install tools for you. A task that needs a tool
+  # checks for it first and prints how to install it.
+
+  generate-tfdocs:
+    aliases:
+      - gen-docs
+    desc: Generate documentation for the code in terraform/.
+    cmds:
+      - terraform-docs terraform/.
+    preconditions:
+      - sh: command -v terraform-docs
+        msg: "terraform-docs is not installed. Install it with your package manager or see https://terraform-docs.io/user-guide/installation/."
+
+  generate-deployment-id:
+    silent: true
+    aliases:
+      - gen-deploy-id
+    desc: Generate a unique deployment id (8 lowercase hex characters).
+    # The ID is 8 hex characters with zero padding, so every ID has the same
+    # length. YAML reads some hex values as numbers: all digits (12345678) or
+    # digits with one "e" (1234e567, a float). OpenTofu then changes the
+    # value. So the loop makes a new value until it has a letter a-f and is
+    # not of the form <digits>e<digits>.
+    cmds:
+      - |
+        while :; do
+          id="$(hexdump -n 4 -e '"%08x"' /dev/urandom)"
+          if ! printf '%s\n' "$id" | grep -q '[a-f]'; then continue; fi
+          if printf '%s\n' "$id" | grep -Eq '^[0-9]+e[0-9]+$'; then continue; fi
+          echo "$id"
+          break
+        done
+    preconditions:
+      - sh: command -v hexdump
+        msg: "hexdump is not installed. Install it with your package manager (on Debian and Ubuntu it is in the bsdextrautils package)."
+
+  format:
+    aliases:
+      - tf-fmt
+    desc: Format the OpenTofu code recursively.
+    cmds:
+      - '"{{.TF_BIN}}" fmt -recursive'
+    preconditions:
+      - sh: 'command -v "{{.TF_BIN}}"'
+        msg: "{{.TF_BIN}} is not installed. Install a version that matches required_version in deployments/versions.tf. For OpenTofu, see https://opentofu.org/docs/intro/install/. TF_BIN picks the command (default tofu)."
+    status:
+      - '"{{.TF_BIN}}" fmt -recursive -check'
+
+  list-deployments:
+    silent: true
+    aliases:
+      - ls-deploys
+    desc: List available deployments and their descriptions (from deployments/configs/).
+    dir: "deployments/"
+    cmds:
+      - |
+        for f in configs/*.yaml; do
+          name=$(basename "$f" .yaml)
+          [ "$name" = "default" ] && continue
+          desc=$(awk '/^description:/{sub(/^description: */,""); gsub(/^"|"$/,""); print; exit}' "$f")
+          printf "%-32s  %s\n" "$name" "$desc"
+        done
+
+  switch:
+    # Silent: do not echo the long script below. OpenTofu prints its own
+    # output.
+    silent: true
+    aliases:
+      - tf-switch
+    desc: Fuzzy-search deployments and run tofu init + workspace select.
+    dir: "deployments/"
+    env:
+      # Share downloaded provider binaries across every project forked from
+      # this template. `tofu init` links from the cache instead of
+      # re-fetching ~600 MB of AWS provider per project. Respects an existing
+      # TF_PLUGIN_CACHE_DIR export so users can point it elsewhere.
+      TF_PLUGIN_CACHE_DIR:
+        sh: echo "${TF_PLUGIN_CACHE_DIR:-$HOME/.terraform.d/plugin-cache}"
+      # The cache only stores the unpacked binary, so OpenTofu can recompute
+      # the `h1:` content hash but not the `zh:` zip hashes. When the committed
+      # lock file has no hash for this machine's platform, OpenTofu would
+      # otherwise skip the cache and download again. This flag lets a cache
+      # hit add the `h1:` hash of this platform to the lock file. Review that
+      # change before you commit it. See "Provider lock file" in README.md.
+      TF_PLUGIN_CACHE_MAY_BREAK_DEPENDENCY_LOCK_FILE: "1"
+      # With Terraform, do not call the HashiCorp version check service. CI
+      # sets the same.
+      CHECKPOINT_DISABLE: "1"
+    # Preconditions run before any command, so nothing changes when a tool is
+    # missing.
+    preconditions:
+      - sh: command -v fzf
+        msg: "fzf is not installed. Install it with your package manager or see https://github.com/junegunn/fzf#installation."
+      - sh: 'command -v "{{.TF_BIN}}"'
+        msg: "{{.TF_BIN}} is not installed. Install a version that matches required_version in deployments/versions.tf. For OpenTofu, see https://opentofu.org/docs/intro/install/. TF_BIN picks the command (default tofu)."
+    cmds:
+      # Build a `<name>  <description>` line per deployment, so fzf shows the
+      # description next to the deployment name. The name alone does not tell
+      # apart deployments that share an env (e.g. two deployments of different
+      # services in the same account). `description:` is optional.
+      # Without it, the line has only the name. fzf's `{1}` placeholder sends
+      # the deployment name to --preview. The last `awk` removes the
+      # description from the selection, so `tofu init` and
+      # `workspace select` get only the name.
+      #
+      # The picker runs here and not in a `vars:` entry. Task works out vars
+      # before it checks preconditions, so a missing fzf would give an empty
+      # name instead of the install hint above.
+      #
+      # If you press Esc, or pick nothing, the task stops before it changes
+      # anything.
+      - |
+        deployment="$(
+          for f in configs/*.yaml; do
+            name=$(basename "$f" .yaml)
+            [ "$name" = "default" ] && continue
+            desc=$(awk '/^description:/{sub(/^description: */,""); gsub(/^"|"$/,""); print; exit}' "$f")
+            printf "%-32s  %s\n" "$name" "$desc"
+          done | fzf --prompt="deployment> " --height=~50% --layout=reverse --preview 'cat configs/{1}.yaml' | awk '{print $1}'
+        )" || true
+        if [ -z "$deployment" ]; then
+          echo "No deployment selected. Nothing was changed." >&2
+          exit 1
+        fi
+        if [ ! -f "backends/$deployment.s3.tfbackend" ]; then
+          echo "deployments/backends/$deployment.s3.tfbackend does not exist. Copy deployments/backends/default.s3.tfbackend and fill it in." >&2
+          exit 1
+        fi
+        # OpenTofu refuses to use the plugin cache unless the directory
+        # already exists, so create it before init.
+        mkdir -p "$TF_PLUGIN_CACHE_DIR"
+        echo "Switching to $deployment"
+        rm -f .terraform/environment
+        "{{.TF_BIN}}" init -backend-config="backends/$deployment.s3.tfbackend" -reconfigure
+        "{{.TF_BIN}}" workspace select -or-create=true "$deployment"
+
+  # A fork uses one CI platform. These two tasks delete the files of the other
+  # platform. Both keep .ci/scripts/, because both platforms run tf.sh.
+  #
+  # Before it deletes anything, each task asks you to confirm. It uses gum
+  # (https://github.com/charmbracelet/gum) when gum is installed. Otherwise it
+  # asks a plain [y/N] question. Any answer other than y or yes cancels. With
+  # no terminal to ask (for example in a script), it cancels too.
+  ci:use-github:
+    silent: true
+    desc: Keep GitHub Actions and delete the GitLab CI files.
+    # When the GitLab CI files are already gone, the task is up to date and
+    # exits with code 0.
+    status:
+      - "! test -e .gitlab-ci.yml && ! test -e .ci/templates && ! test -e .ci/configs && ! test -e .ci/image"
+    preconditions:
+      - sh: test -d .github/workflows
+        msg: ".github/workflows/ does not exist. Nothing would run CI after this task, so it stops."
+    cmds:
+      - |
+        confirm() {
+          if command -v gum >/dev/null 2>&1; then
+            # Return gum's answer explicitly. Task's shell returns 0 for a
+            # bare `return` here.
+            if gum confirm "$1"; then return 0; else return 1; fi
+          fi
+          printf '%s [y/N] ' "$1"
+          answer=""
+          read -r answer || return 1
+          case "$answer" in
+            y | Y | yes | Yes | YES) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        paths=()
+        for p in .gitlab-ci.yml .ci/templates .ci/configs .ci/image; do
+          [ -e "$p" ] && paths+=("$p")
+        done
+        echo "These GitLab CI files will be deleted:"
+        printf '  %s\n' "${paths[@]}"
+        if ! confirm "Delete them and keep GitHub Actions?"; then
+          echo
+          echo "Cancelled. Nothing was deleted."
+          exit 0
+        fi
+        echo
+        rm -rf -- "${paths[@]}"
+        echo "Deleted. GitHub Actions is now the CI platform."
+        echo
+        echo "Next steps (see README.md):"
+        echo "  1. Make an IAM OIDC provider and roles for GitHub (CI Auth > GitHub OIDC)."
+        echo "  2. Set ci.aws_role_arn in each deployment config."
+        echo "  3. Make the GitHub Environments develop, stage, prod and destroy (Pipeline > GitHub Environments)."
+        echo "  4. If an apply can take longer than 55 minutes, set the AWS_ROLE_DURATION_SECONDS variable (CI Auth > AWS session length on GitHub)."
+        echo "  5. Delete the GitLab parts of README.md."
+
+  ci:use-gitlab:
+    silent: true
+    desc: Keep GitLab CI and delete the GitHub Actions files.
+    # When .github/ is already gone, the task is up to date and exits with
+    # code 0.
+    status:
+      - "! test -e .github"
+    preconditions:
+      - sh: test -f .gitlab-ci.yml
+        msg: ".gitlab-ci.yml does not exist. Nothing would run CI after this task, so it stops."
+    cmds:
+      - |
+        confirm() {
+          if command -v gum >/dev/null 2>&1; then
+            # Return gum's answer explicitly. Task's shell returns 0 for a
+            # bare `return` here.
+            if gum confirm "$1"; then return 0; else return 1; fi
+          fi
+          printf '%s [y/N] ' "$1"
+          answer=""
+          read -r answer || return 1
+          case "$answer" in
+            y | Y | yes | Yes | YES) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        echo "This folder and everything in it will be deleted:"
+        echo "  .github/"
+        find .github -type f | sed 's/^/    /'
+        if ! confirm "Delete it and keep GitLab CI?"; then
+          echo
+          echo "Cancelled. Nothing was deleted."
+          exit 0
+        fi
+        echo
+        rm -rf -- .github
+        echo "Deleted. GitLab CI is now the CI platform."
+        echo
+        echo "Next steps (see README.md):"
+        echo "  1. Make an IAM OIDC provider and roles for GitLab (CI Auth > GitLab OIDC)."
+        echo "  2. Set ci.aws_role_arn in each deployment config."
+        echo "  3. Add a job per deployment in .ci/configs/ (Adding a deployment)."
+        echo "  4. Build the CI image from .ci/image/Dockerfile and push it to the registry (CI image)."
+        echo "  5. Protect the default branch and the prod environments (Pipeline > GitLab environments)."
+        echo "  6. Delete the GitHub parts of README.md."

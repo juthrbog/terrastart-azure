@@ -1,0 +1,22 @@
+# Documents the required tfbackend structure and possible values.
+# Copy this file for each deployment you need and remove all comments.
+# Name the copy after its config file, in the format
+# <env>-<deployment_id>.s3.tfbackend.
+
+# tfstate path will be:
+#  <bucket>/<workspace_key_prefix>/<tf_workspace_name>/<key>
+
+# The S3 state bucket for this deployment's account and region, e.g.
+# <state-bucket-name>.
+bucket               = ""
+key                  = "terraform.tfstate"
+workspace_key_prefix = ""
+# Optional. A KMS key that encrypts the state objects. Use the key that
+# belongs to the same account and region as the bucket above. Leave the line
+# commented out to use the bucket's default encryption. Do not set it to "":
+# an empty value makes `tofu init` fail with "Invalid KMS Key ID".
+# kms_key_id         = "arn:aws:kms:<region>:<account-id>:key/<key-id>"
+encrypt              = "true"
+use_lockfile         = "true"
+# Region of the state bucket, e.g. us-east-1.
+region               = ""

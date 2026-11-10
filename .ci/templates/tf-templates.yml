@@ -1,0 +1,223 @@
+# OpenTofu job templates.
+#
+# The jobs in .ci/configs/ extend the `.validate`, `.plan`, `.apply`,
+# `.destroy-plan` and `.destroy` templates defined here.
+#
+# AWS auth is OIDC (OpenID Connect): GitLab mints a JWT (JSON Web Token) per
+# job, .ci/scripts/tf.sh writes it to disk, and the AWS SDK credential chain
+# exchanges it for role credentials. Each deployment job sets only DEPLOYMENT.
+# tf.sh reads the role ARN from ci.aws_role_arn in
+# deployments/configs/$DEPLOYMENT.yaml. CI authenticates with OIDC only.
+# Static AWS access keys are not used.
+
+default:
+  # No pull_policy here. Some runners allow only if-not-present, and a job
+  # that asks for another policy fails on them. The image tag is versioned, so
+  # the runner's default policy is enough.
+  image:
+    name: $TF_IMAGE
+  # Set this to the tag of the runners that can reach your state bucket and
+  # target accounts. Remove the block entirely to use any available runner.
+  # tags:
+  #   - <runner-tag>
+  # Do not set `interruptible` here. It is set per template below, so a new
+  # commit can never cancel a running apply or destroy.
+  # OIDC setup: .ci/scripts/tf.sh reads GITLAB_OIDC_TOKEN. Declaring
+  # id_tokens here covers every job. If a project overrides `default:` and drops
+  # this key, GITLAB_OIDC_TOKEN is empty, and tf.sh stops every AWS-touching
+  # job with an auth error.
+  id_tokens:
+    GITLAB_OIDC_TOKEN:
+      aud: $OIDC_AUDIENCE
+
+# One plan and one apply stage per tier, then one destroy stage per tier. The
+# tiers must match TIERS in .ci/scripts/tf.sh. See "Change the tiers" in
+# README.md.
+stages:
+  - validate
+  - plan-develop
+  - apply-develop
+  - plan-stage
+  - apply-stage
+  - plan-prod
+  - apply-prod
+  - destroy-develop
+  - destroy-stage
+  - destroy-prod
+
+variables:
+  # Container image for every job. Build it from .ci/image/Dockerfile and push
+  # it to this project's container registry (see "CI image" in README.md).
+  # The tag matches the OpenTofu version in the Dockerfile and in
+  # .github/actions/setup-tools/action.yml. Point this at
+  # another registry if your runners pull from somewhere else.
+  TF_IMAGE: $CI_REGISTRY_IMAGE/tofu:1.13.1
+  # OIDC token audience. Must match the `aud` condition on the IAM OIDC
+  # provider in every target AWS account. The default is the URL of this
+  # GitLab instance, for example https://gitlab.com. On a self-managed
+  # instance it is your own GitLab URL. Use that URL for the IAM OIDC
+  # provider too.
+  OIDC_AUDIENCE: $CI_SERVER_URL
+  # tf.sh always runs `aws sts get-caller-identity` at the start of each
+  # AWS-touching job and checks that the caller is the role in ci.aws_role_arn.
+  # If that check fails, "true" also prints the claims in the GitLab JWT, so
+  # you can compare them with the role trust policy. "false" hides the claims.
+  # In CI it never skips the identity check.
+  PRINT_OIDC_CLAIMS: "true"
+  # tf.sh writes the JWT to a per-job file, sets AWS_WEB_IDENTITY_TOKEN_FILE to
+  # it, and deletes it when the job ends. The AWS SDK credential chain reads
+  # that file. tf.sh also exports AWS_ROLE_ARN (from ci.aws_role_arn) and
+  # AWS_REGION and AWS_DEFAULT_REGION (from aws.region) from the deployment
+  # config.
+  AWS_ROLE_SESSION_NAME: gl-$CI_PROJECT_ID-$CI_PIPELINE_ID-$CI_JOB_ID
+
+# Every job runs one command of .ci/scripts/tf.sh. The same script runs on
+# GitHub Actions, so both platforms run the same OpenTofu steps. tf.sh reads
+# DEPLOYMENT, loads deployments/configs/$DEPLOYMENT.yaml with yq, sets up auth
+# and then runs OpenTofu. The image built from .ci/image/Dockerfile has every
+# tool tf.sh needs. A different image must have at least bash and mikefarah
+# yq 4.18 or newer.
+#
+# Auth runs inside tf.sh, as the first step of `script`, not in a
+# `before_script`.
+#
+# resource_group: $DEPLOYMENT makes GitLab run at most one AWS-touching job
+# per deployment at a time, across all pipelines. This stops two pipelines
+# from changing the same state at once. GitLab expands CI/CD
+# variables in resource_group, so one template line covers every deployment.
+# A newer pipeline can still plan between an older pipeline's plan and apply.
+# Its apply then fails with "Saved plan is stale". Re-run its plan job, then
+# its apply job.
+#
+# interruptible: when a new commit starts a pipeline on a branch, GitLab can
+# cancel the older pipeline (auto-cancel). Only validate and plan are safe to
+# stop, so only they set `interruptible: true`. Apply, destroy-plan and
+# destroy set `interruptible: false`. Once one of them starts, GitLab keeps
+# the older pipeline running. Do not move `interruptible: true` into
+# `default:`. On the default branch, workflow:rules in .gitlab-ci.yml also
+# turns auto-cancel off, so a queued apply is never cancelled.
+#
+# environment: apply starts the environment named $DEPLOYMENT and destroy
+# stops it. Plan and destroy-plan only prepare it, so they create no
+# deployment. With environments you can use protected environments,
+# deployment approvals, "Prevent outdated deployment jobs", and the
+# `environment` and `environment_protected` claims in the OIDC token.
+#
+# Plan artifacts: plan and destroy-plan save the plan file, a copy of the
+# provider lock file (tf.sh restores it before apply or destroy runs
+# `tofu init`) and, for plan, the change marker. `access: developer`
+# hides them from users with less than the Developer role, because a plan
+# file can hold secret values. Apply and destroy upload nothing.
+
+.validate:
+  interruptible: true
+  script:
+    - bash "$CI_PROJECT_DIR/.ci/scripts/tf.sh" validate
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: always
+    - if: '$CI_COMMIT_BRANCH'
+      when: always
+
+.plan:
+  interruptible: true
+  resource_group: $DEPLOYMENT
+  environment:
+    name: $DEPLOYMENT
+    action: prepare
+  artifacts:
+    access: developer
+    expire_in: 1 week
+    paths:
+      - deployments/$DEPLOYMENT.out
+      - deployments/$DEPLOYMENT.lock.hcl
+      - deployments/$DEPLOYMENT.changes
+  script:
+    - bash "$CI_PROJECT_DIR/.ci/scripts/tf.sh" plan
+  rules:
+    # Destroy wins over force-plan and force-apply.
+    - if: '$DESTROY == "false" && ($FORCE_PLAN == "true" || $FORCE_APPLY == "true")'
+      when: always
+    - if: '$DESTROY == "false" && $CI_PIPELINE_SOURCE == "merge_request_event"'
+      changes:
+        - "deployments/**/*"
+        - "deployments/*"
+        - "terraform/**/*"
+        - "terraform/*"
+    # Push to a branch that is not the default branch. workflow:rules in
+    # .gitlab-ci.yml drops this pipeline when the branch has an open MR, so
+    # the MR pipeline plans instead.
+    - if: '$DESTROY == "false" && $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      changes:
+        - "deployments/**/*"
+        - "deployments/*"
+        - "terraform/**/*"
+        - "terraform/*"
+    - if: '$DESTROY == "false" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: on_success
+
+# Rules run before the script, so they cannot see values that tf.sh reads
+# from the config. Prod is found by the DEPLOYMENT name instead: it starts with
+# the env, and tf.sh fails if the name does not match the config.
+.apply:
+  interruptible: false
+  resource_group: $DEPLOYMENT
+  environment:
+    name: $DEPLOYMENT
+    action: start
+  script:
+    - bash "$CI_PROJECT_DIR/.ci/scripts/tf.sh" apply
+  rules:
+    # Destroy wins over force-apply.
+    - if: '$DESTROY == "false" && $FORCE_APPLY == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - if: '$DESTROY == "false" && $DEPLOYMENT =~ /^prod-/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+      changes:
+        - "deployments/**/*"
+        - "deployments/*"
+        - "terraform/**/*"
+        - "terraform/*"
+    - if: '$DESTROY == "false" && $DEPLOYMENT !~ /^prod-/ && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      changes:
+        - "deployments/**/*"
+        - "deployments/*"
+        - "terraform/**/*"
+        - "terraform/*"
+      when: on_success
+
+.destroy-rules:
+  destroy-plan:
+    - if: '$DESTROY == "true"'
+  destroy:
+    - if: '$DESTROY == "true" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+      when: manual
+    - when: never
+
+.destroy-plan:
+  interruptible: false
+  resource_group: $DEPLOYMENT
+  environment:
+    name: $DEPLOYMENT
+    action: prepare
+  artifacts:
+    access: developer
+    expire_in: 1 week
+    paths:
+      - deployments/$DEPLOYMENT-destroy.out
+      - deployments/$DEPLOYMENT-destroy.lock.hcl
+  script:
+    - bash "$CI_PROJECT_DIR/.ci/scripts/tf.sh" destroy-plan
+  rules:
+    - !reference [.destroy-rules, destroy-plan]
+
+.destroy:
+  interruptible: false
+  resource_group: $DEPLOYMENT
+  environment:
+    name: $DEPLOYMENT
+    action: stop
+  script:
+    - bash "$CI_PROJECT_DIR/.ci/scripts/tf.sh" destroy
+  rules:
+    - !reference [.destroy-rules, destroy]

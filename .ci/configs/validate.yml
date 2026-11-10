@@ -1,0 +1,3 @@
+validate:
+  stage: validate
+  extends: .validate

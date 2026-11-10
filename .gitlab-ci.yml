@@ -1,0 +1,59 @@
+spec:
+  inputs:
+    destroy:
+      default: false
+      description: Only adds Destroy jobs to the pipeline, if true. Only the destroy plan job is added if the targeted branch is not the default branch.
+      type: boolean
+    force-plan:
+      default: false
+      description: Will add all plan jobs to the pipeline, if true.
+      type: boolean
+    force-apply:
+      default: false
+      description: Will add all plan & apply jobs to the pipeline, if true. Apply jobs are only added for pipelines against the default branch.
+      type: boolean
+---
+
+include:
+  # Job templates. `.ci/templates/tf-templates.yml` defines the `.validate`,
+  # `.plan`, `.apply`, `.destroy-plan` and `.destroy` templates, the stage
+  # list, and the `default:` image and id_tokens. All job definitions are in
+  # this repo.
+  - local: .ci/templates/*.yml
+  # Per-deployment jobs that extend the templates above.
+  - local: .ci/configs/*.yml
+
+# Which pipelines run:
+#   - Merge request (MR) pipelines.
+#   - Branch pipelines, except a push to a branch that has an open MR. The MR
+#     pipeline covers that push, so jobs do not run twice. Pipelines started
+#     by hand, by a schedule or by the API still run on such a branch.
+#   - No tag pipelines.
+# auto_cancel: on the default branch a new commit never cancels the older
+# pipeline, so every merged change gets its plan and apply. On other branches
+# GitLab cancels the older pipeline only while no non-interruptible job
+# (apply, destroy-plan, destroy) has started.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_PIPELINE_SOURCE == "push"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      auto_cancel:
+        on_new_commit: none
+    - if: $CI_COMMIT_BRANCH
+      auto_cancel:
+        on_new_commit: conservative
+
+variables:
+  DESTROY: '$[[ inputs.destroy ]]'
+  FORCE_APPLY: '$[[ inputs.force-apply ]]'
+  FORCE_PLAN: '$[[ inputs.force-plan ]]'
+
+# Each deployment job sets only one variable, DEPLOYMENT. Its value is the
+# name of a config file in deployments/configs/ without ".yaml", for example
+# develop-a1b2c3d4. .ci/scripts/tf.sh reads env, deployment_id, aws.region
+# and ci.aws_role_arn from that file. ci.aws_role_arn must be a
+# real IAM role ARN whose trust policy allows the GitLab OIDC provider as a
+# Federated principal. Provision these per-deployment roles wherever you manage
+# IAM. See the job examples in .ci/configs/.

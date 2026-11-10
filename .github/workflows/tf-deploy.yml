@@ -1,0 +1,226 @@
+# Reusable workflow: runs one tf.sh command for every deployment in one tier.
+#
+# terraform.yml calls this workflow once per tier and step, for example
+# "plan the develop tier" or "apply the prod tier". It is not meant to run on
+# its own. All the OpenTofu logic is in .ci/scripts/tf.sh; this file only
+# sets up the runner, gets AWS credentials, and moves plan files between jobs.
+#
+# Each deployment in the tier gets its own job (a matrix job). The deployments
+# run in parallel, and one failure does not stop the others (fail-fast: false).
+#
+# For plan, a second job ("changes") then lists the deployments whose plan
+# has changes. terraform.yml applies only those. See the "changed" output.
+
+name: tf-deploy
+
+on:
+  workflow_call:
+    inputs:
+      command:
+        description: The tf.sh command to run. One of plan, apply, destroy-plan or destroy.
+        required: true
+        type: string
+      deployments:
+        description: >-
+          JSON array of {"deployment", "region", "role_arn"} objects, one per
+          deployment. This is one tier's line from `tf.sh matrix`, or the
+          "changed" output of the plan call for apply. It must not be empty
+          ("[]"); the caller skips the call in that case.
+        required: true
+        type: string
+      environment:
+        description: >-
+          GitHub Environment for the job, for example prod or destroy. An
+          empty string means no environment. Apply and destroy use an
+          environment so that its protection rules (required reviewers,
+          allowed branches) apply. Plan and destroy-plan do not.
+        required: false
+        type: string
+        default: ""
+      role-duration-seconds:
+        description: >-
+          How long the AWS credentials last, in seconds. The setup job in
+          terraform.yml reads it from the AWS_ROLE_DURATION_SECONDS
+          repository variable.
+        required: false
+        type: number
+        default: 3600
+      timeout-minutes:
+        description: >-
+          Job time limit in minutes. It must be shorter than
+          role-duration-seconds, so that a slow job stops before its AWS
+          credentials expire. The setup job in terraform.yml works it out.
+        required: false
+        type: number
+        default: 55
+    outputs:
+      changed:
+        description: >-
+          Plan only. JSON array of the "deployments" entries whose plan has
+          changes, in the same format. "[]" when no plan has changes. Empty
+          for the other commands.
+        value: ${{ jobs.changes.outputs.changed }}
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Use bash with -e and -o pipefail. Without this, GitHub runs plain
+    # `bash -e`, which hides errors inside pipes.
+    shell: bash
+
+jobs:
+  run:
+    name: ${{ inputs.command }} ${{ matrix.deployment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    # The AWS credentials below last role-duration-seconds and do not renew.
+    # Stop the job a few minutes before that, so it does not lose access to
+    # AWS in the middle of a state write. Time spent waiting for approval or
+    # in the concurrency queue does not count.
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    # One job at a time per deployment, across all runs of this repo. This
+    # stops two runs from changing the same state at once. A job
+    # that is already running is never cancelled. Note that GitHub keeps only
+    # one waiting job per group: if a third job joins the queue, the older
+    # waiting job is cancelled. Pull request plans share this group, so they
+    # can cancel a waiting plan or apply of a default-branch run. README.md
+    # ("One job per deployment at a time") says how to recover.
+    concurrency:
+      group: tf-${{ matrix.deployment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      # Lets configure-aws-credentials ask GitHub for an OIDC token.
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.deployments) }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OpenTofu and yq
+        uses: ./.github/actions/setup-tools
+
+      # Trade the GitHub OIDC token for credentials of the deployment's role
+      # (ci.aws_role_arn in its config). The action exports
+      # AWS_ACCESS_KEY_ID and friends. tf.sh then checks that the caller
+      # identity is that role in that account, and fails if it is not.
+      #
+      # The role's MaxSessionDuration in IAM must be at least
+      # role-duration-seconds, or this step fails. See README.md
+      # ("AWS session length on GitHub").
+      - name: Get AWS credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ matrix.role_arn }}
+          aws-region: ${{ matrix.region }}
+          role-session-name: gh-${{ github.run_id }}-${{ github.run_attempt }}
+          role-duration-seconds: ${{ inputs.role-duration-seconds }}
+
+      # apply and destroy use the plan file that the plan job of the same run
+      # saved. They never make a new plan, so they change exactly what the
+      # plan showed. The artifact also holds the provider lock file from the
+      # plan. tf.sh puts it back before `tofu init`, so init installs the
+      # same provider versions that made the plan.
+      - name: Download the plan file
+        if: inputs.command == 'apply' || inputs.command == 'destroy'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.command == 'apply' && 'plan' || 'plan-destroy' }}-${{ matrix.deployment }}
+          path: deployments
+
+      - name: Run tf.sh ${{ inputs.command }}
+        env:
+          COMMAND: ${{ inputs.command }}
+          DEPLOYMENT: ${{ matrix.deployment }}
+        run: .ci/scripts/tf.sh "$COMMAND"
+
+      # Keep the plan file for the apply or destroy job that comes next,
+      # with the provider lock file that tf.sh saved next to it. A plan also
+      # keeps its change marker (<deployment>.changes, "true" or "false").
+      # Seven days matches the GitLab artifact expiry. A plan file holds every
+      # value in plain text, sensitive ones too. Everyone who can read the
+      # repository can download it. See README.md ("Plan files hold secrets").
+      - name: Upload the plan file
+        if: inputs.command == 'plan' || inputs.command == 'destroy-plan'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.command == 'plan' && 'plan' || 'plan-destroy' }}-${{ matrix.deployment }}
+          path: |
+            deployments/${{ matrix.deployment }}${{ inputs.command == 'destroy-plan' && '-destroy' || '' }}.out
+            deployments/${{ matrix.deployment }}${{ inputs.command == 'destroy-plan' && '-destroy' || '' }}.lock.hcl
+            ${{ inputs.command == 'plan' && format('deployments/{0}.changes', matrix.deployment) || '' }}
+          if-no-files-found: error
+          retention-days: 7
+          # A re-run of a failed job uploads again under the same name.
+          overwrite: true
+
+      # The change marker again, as its own small artifact. The changes job
+      # below downloads all markers at once, without the plan files.
+      - name: Upload the change marker
+        if: inputs.command == 'plan'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: changes-${{ matrix.deployment }}
+          path: deployments/${{ matrix.deployment }}.changes
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  # Plan only. Lists the deployments whose plan has changes, so terraform.yml
+  # applies only those. A tier where no plan has changes gets "[]", and its
+  # apply job is skipped. So nobody has to approve an apply that would do
+  # nothing. Runs only when every plan in the tier succeeded.
+  changes:
+    needs: run
+    if: inputs.command == 'plan'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.filter.outputs.changed }}
+    steps:
+      # Downloads the markers of every tier in this run. The next step only
+      # reads the ones for this tier.
+      - name: Download the change markers
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: changes-*
+          path: markers
+          merge-multiple: true
+
+      - name: List the deployments with changes
+        id: filter
+        env:
+          DEPLOYMENTS: ${{ inputs.deployments }}
+        run: |
+          changed='[]'
+          while IFS= read -r entry; do
+            deployment="$(jq -r '.deployment' <<<"$entry")"
+            marker="markers/$deployment.changes"
+            if [[ ! -f "$marker" ]]; then
+              echo "::error::No change marker for $deployment. The plan job must write deployments/$deployment.changes."
+              exit 1
+            fi
+            value="$(<"$marker")"
+            case "$value" in
+              true)
+                echo "$deployment: plan has changes."
+                changed="$(jq -c --argjson e "$entry" '. + [$e]' <<<"$changed")"
+                ;;
+              false)
+                echo "$deployment: no changes. Its apply is skipped."
+                ;;
+              *)
+                echo "::error::Change marker for $deployment holds '$value', not 'true' or 'false'."
+                exit 1
+                ;;
+            esac
+          done < <(jq -c '.[]' <<<"$DEPLOYMENTS")
+          echo "changed=$changed" | tee -a "$GITHUB_OUTPUT"

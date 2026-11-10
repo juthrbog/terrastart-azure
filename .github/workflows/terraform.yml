@@ -1,0 +1,553 @@
+# OpenTofu pipeline for GitHub Actions.
+#
+# This is the GitHub version of the GitLab pipeline in .gitlab-ci.yml. A fork
+# uses one of the two. Run `task ci:use-github` to remove the GitLab files.
+# Both pipelines call .ci/scripts/tf.sh, so the OpenTofu steps are the same.
+#
+# Jobs run in this order, like the GitLab stages:
+#
+#   validate + setup
+#   -> plan-develop -> apply-develop -> plan-stage -> apply-stage
+#   -> plan-prod -> apply-prod
+#
+# apply-<tier> applies only the deployments whose plan has changes. Each plan
+# call reports them in its "changed" output (see tf-deploy.yml). When no plan
+# in a tier has changes, the apply job is skipped, so nobody has to approve
+# an apply that would do nothing. This is also true with force-apply.
+#
+# When the workflow is started by hand with destroy=true, only these run, and
+# only for the one deployment named in the "deployment" input:
+#
+#   validate + setup
+#   -> destroy-plan-<tier> -> destroy-<tier>
+#
+# (The file has destroy jobs for every tier. Only the tier of that
+# deployment has a non-empty list, so the other destroy jobs are skipped.)
+#
+# A merge queue run (merge_group) runs only validate and setup. The pull
+# request plan has already run.
+#
+# AWS session length: the repository variable AWS_ROLE_DURATION_SECONDS sets
+# how long the AWS credentials of a job last (default 3600, one hour). Each
+# job stops 5 minutes before that. Raise it for long applies, and raise the
+# MaxSessionDuration of every deployment role to match. See README.md
+# ("AWS session length on GitHub").
+#
+# The tiers here must match TIERS in .ci/scripts/tf.sh. To add, remove or
+# rename a tier, see README.md ("Change the tiers").
+#
+# A tier is a group of deployments with the same `env` value in their config
+# (develop, stage or prod). The deployment list comes from
+# deployments/configs/*.yaml: the setup job runs `tf.sh matrix` to read it. You
+# do not list deployments in this file.
+#
+# Why a reusable workflow: each tier job above calls tf-deploy.yml, which
+# holds the real steps (checkout, OpenTofu, AWS credentials, plan files) once.
+# A job here only says which command, which tier, and which GitHub
+# Environment. Without it, the same 40 lines of steps would repeat 12 times.
+#
+# How skipping works: a job is "skipped" when its `if:` is false, for example
+# a tier with no deployments, or apply on a pull request. By default GitHub
+# also skips every job that comes after a skipped job. That would stop the
+# chain at the first empty tier. So each tier job starts its `if:` with
+# `!cancelled() && !failure() && !contains(needs.*.result, 'cancelled')`.
+# That means "run even if an earlier job was skipped, but not if an earlier
+# job failed or was cancelled". This matches GitLab, where later stages do
+# not run after a failed stage.
+#
+# Why each tier job lists every earlier tier job in `needs:`:
+#   - failure() is true when any job earlier in the chain failed, not only a
+#     job in `needs:`.
+#   - cancelled() is true only when the whole run was cancelled. A single job
+#     can also end as "cancelled", for example when the per-deployment
+#     concurrency queue in tf-deploy.yml cancels it. The run then goes on.
+#   - needs.*.result holds only the jobs listed in `needs:`. If apply-develop
+#     is cancelled, plan-stage is skipped, and a job that needs only
+#     plan-stage sees "skipped", not "cancelled". So each job lists all
+#     earlier jobs, and a cancelled job anywhere before it stops it.
+#
+# GitHub Environments (set them up under Settings > Environments, see
+# README.md):
+#   - Plan and destroy-plan jobs use no environment.
+#   - apply-<tier> jobs use the environment named after the tier. Give "prod"
+#     required reviewers. That is the GitHub version of GitLab's manual prod
+#     apply.
+#   - destroy-<tier> jobs use the "destroy" environment. Give it required
+#     reviewers.
+#   - Limit all four environments (develop, stage, prod and destroy) to the
+#     default branch.
+
+name: terraform
+
+on:
+  # Every branch push. Tag pushes do not run the pipeline. Merge queue
+  # branches (gh-readonly-queue/...) are left out: the merge_group event
+  # below covers them.
+  push:
+    branches: ["**", "!gh-readonly-queue/**"]
+  pull_request:
+  # GitHub merge queue. A queue needs this event to get its required checks.
+  # It runs only validate and setup.
+  merge_group:
+  # Start by hand from the Actions tab. Same inputs as the GitLab pipeline,
+  # plus "deployment" for destroy.
+  workflow_dispatch:
+    inputs:
+      destroy:
+        description: Only adds Destroy jobs to the pipeline, if true. Needs "deployment". Only the destroy plan job is added if the targeted branch is not the default branch.
+        type: boolean
+        default: false
+      deployment:
+        description: The one deployment to destroy, for example develop-a1b2c3d4 (its config file name without .yaml). Required when destroy is true. Leave empty otherwise.
+        type: string
+        default: ""
+      force-plan:
+        description: Will add all plan jobs to the pipeline, if true.
+        type: boolean
+        default: false
+      force-apply:
+        description: Will add all plan & apply jobs to the pipeline, if true. Apply jobs are only added for pipelines against the default branch, and only for deployments whose plan has changes.
+        type: boolean
+        default: false
+
+# Least access by default. Jobs that talk to AWS add id-token: write.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    # Use bash with -e and -o pipefail. Without this, GitHub runs plain
+    # `bash -e`, which hides errors inside pipes.
+    shell: bash
+
+jobs:
+  # Checks formatting, runs tofu validate, and runs shellcheck on
+  # .ci/scripts/. It needs no AWS access, so it also runs on pull requests
+  # from forks. GitHub gives those no OIDC token, so they run only this job
+  # and the setup job. No job that uses AWS runs.
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OpenTofu and yq
+        uses: ./.github/actions/setup-tools
+
+      # ubuntu-latest already has shellcheck, so tf.sh checks the scripts too.
+      - name: Run tf.sh validate
+        run: .ci/scripts/tf.sh validate
+
+  # Works out what this run should do. Later jobs only read its outputs.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      # One JSON list of deployments per tier, from `tf.sh matrix`.
+      develop: ${{ steps.matrix.outputs.develop }}
+      stage: ${{ steps.matrix.outputs.stage }}
+      prod: ${{ steps.matrix.outputs.prod }}
+      # Facts about this run, "true" or "false".
+      changed: ${{ steps.decide.outputs.changed }}
+      is_default_branch: ${{ steps.decide.outputs.is_default_branch }}
+      same_repo: ${{ steps.decide.outputs.same_repo }}
+      # What to run, "true" or "false". See the decide step for the rules.
+      plan: ${{ steps.decide.outputs.plan }}
+      apply: ${{ steps.decide.outputs.apply }}
+      destroy_plan: ${{ steps.decide.outputs.destroy_plan }}
+      destroy: ${{ steps.decide.outputs.destroy }}
+      # AWS session length in seconds, and the job time limit in minutes
+      # that goes with it. Every tf-deploy.yml call gets both.
+      role_duration_seconds: ${{ steps.session.outputs.role_duration_seconds }}
+      timeout_minutes: ${{ steps.session.outputs.timeout_minutes }}
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # Full history, so git diff can compare against the base branch
+          # or the commit before the push.
+          fetch-depth: 0
+
+      - name: Install OpenTofu and yq
+        uses: ./.github/actions/setup-tools
+
+      # Destroy works on one deployment at a time. A run with destroy=true
+      # must name it in the "deployment" input. The input goes in through an
+      # env var, never straight into the script.
+      - name: Check the deployment input
+        env:
+          DESTROY: ${{ inputs.destroy == true }}
+          DEPLOYMENT: ${{ inputs.deployment }}
+        run: |
+          if [[ "$DESTROY" == true ]]; then
+            if [[ -z "$DEPLOYMENT" ]]; then
+              echo "::error::destroy is true, but the deployment input is empty. Enter the one deployment to destroy, for example develop-a1b2c3d4."
+              exit 1
+            fi
+            # A config file name: letters, digits, dots, dashes, underscores.
+            if [[ ! "$DEPLOYMENT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+              echo "::error::The deployment input is not a valid deployment name. Use the config file name from deployments/configs/ without .yaml."
+              exit 1
+            fi
+            echo "Destroy only this deployment: $DEPLOYMENT"
+          elif [[ -n "$DEPLOYMENT" ]]; then
+            echo "::error::The deployment input is only for destroy. Set destroy to true, or leave deployment empty."
+            exit 1
+          fi
+
+      # Fails if any deployment config is not valid. The output is also
+      # printed to the log, so you can see the deployment list. For destroy,
+      # ONLY_DEPLOYMENT keeps only the one deployment to destroy, and tf.sh
+      # fails if no config has that name.
+      - name: List deployments per tier
+        id: matrix
+        env:
+          ONLY_DEPLOYMENT: ${{ inputs.destroy == true && inputs.deployment || '' }}
+        run: .ci/scripts/tf.sh matrix | tee -a "$GITHUB_OUTPUT"
+
+      # AWS_ROLE_DURATION_SECONDS is a repository variable (Settings >
+      # Secrets and variables > Actions > Variables). Unset means 3600. AWS
+      # allows 900 to 43200. Each deployment role's MaxSessionDuration must
+      # be at least this long. The job limit is 5 minutes shorter, so a slow
+      # job stops before its credentials expire. GitHub expressions cannot do
+      # math, so this step works out the number. Note: GitHub-hosted runners
+      # stop every job after 6 hours, so more than 21900 gives no extra time.
+      - name: Work out the AWS session length
+        id: session
+        env:
+          DURATION: ${{ vars.AWS_ROLE_DURATION_SECONDS }}
+        run: |
+          duration="${DURATION:-3600}"
+          if [[ ! "$duration" =~ ^[0-9]+$ ]] || ((10#$duration < 900 || 10#$duration > 43200)); then
+            echo "::error::AWS_ROLE_DURATION_SECONDS is '$duration'. It must be a whole number of seconds from 900 to 43200."
+            exit 1
+          fi
+          duration=$((10#$duration))
+          {
+            echo "role_duration_seconds=$duration"
+            echo "timeout_minutes=$((duration / 60 - 5))"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      # The rules below copy the GitLab .plan and .apply rules. "changed"
+      # means a file under deployments/ or terraform/ changed.
+      #
+      # plan runs when:
+      #   destroy is false, and
+      #   force-plan or force-apply is true, or
+      #   changed is true and either
+      #     - this is a pull request from a branch of this repo, or
+      #     - this is a push to the default branch.
+      #
+      #   Unlike GitLab, a push to another branch does not plan on its own.
+      #   Open a pull request to get plans. This avoids two plans for every
+      #   push to a branch that has a pull request.
+      #
+      # apply runs when:
+      #   destroy is false, and this run is on the default branch (a push
+      #   or a manual run, not a pull request), and changed or force-apply
+      #   is true. Each apply also needs its own plan job to succeed.
+      #
+      #   apply only covers the deployments whose plan has changes, even
+      #   with force-apply. Applying a plan with no changes does nothing.
+      #
+      # destroy_plan runs when destroy is true, on any branch.
+      # destroy runs when destroy is true and the run is on the default
+      # branch. Both cover only the deployment in the "deployment" input.
+      #
+      # A merge queue run (merge_group) plans and applies nothing. The pull
+      # request plan has already run, and the queue branch is not the
+      # default branch.
+      #
+      # GitHub event data goes in through env vars, never straight into the
+      # script, so text in it cannot run as shell code.
+      - name: Decide which jobs run
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REPO: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+          # Inputs exist only on manual runs. Elsewhere these are "false".
+          DESTROY: ${{ inputs.destroy == true }}
+          FORCE_PLAN: ${{ inputs.force-plan == true }}
+          FORCE_APPLY: ${{ inputs.force-apply == true }}
+        run: |
+          # List the changed files. If git cannot tell (for example the old
+          # commit is gone after a force push), count it as changed. A plan
+          # is safe to run, and missing a change is worse.
+          changed_files() {
+            case "$EVENT_NAME" in
+              pull_request)
+                # Three dots: only the changes made on the pull request
+                # branch, not the changes made on the base branch since.
+                git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA"
+                ;;
+              push)
+                # A new branch has no "before" commit (all zeros).
+                if [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
+                  echo "New branch: no earlier commit to compare with." >&2
+                  return 1
+                fi
+                git diff --name-only "$PUSH_BEFORE_SHA" "$PUSH_AFTER_SHA"
+                ;;
+            esac
+          }
+
+          changed=false
+          if [[ "$EVENT_NAME" == pull_request || "$EVENT_NAME" == push ]]; then
+            if files="$(changed_files)"; then
+              if grep -qE '^(deployments|terraform)/' <<<"$files"; then
+                changed=true
+              fi
+            else
+              echo "Could not list the changed files. Treating deployments/ and terraform/ as changed."
+              changed=true
+            fi
+          fi
+          # A manual run (workflow_dispatch) has nothing to compare, so
+          # changed stays false. Use force-plan or force-apply instead.
+          # A merge queue run (merge_group) also keeps changed=false, and
+          # it has no inputs, so it plans and applies nothing.
+
+          is_default_branch=false
+          if [[ "$EVENT_NAME" != pull_request && "$REF" == "refs/heads/$DEFAULT_BRANCH" ]]; then
+            is_default_branch=true
+          fi
+
+          # Pull requests from forks get no OIDC token, so they cannot plan.
+          same_repo=true
+          if [[ "$EVENT_NAME" == pull_request && "$PR_HEAD_REPO" != "$REPO" ]]; then
+            same_repo=false
+          fi
+
+          plan=false
+          if [[ "$DESTROY" != true ]]; then
+            if [[ "$FORCE_PLAN" == true || "$FORCE_APPLY" == true ]]; then
+              plan=true
+            elif [[ "$changed" == true ]]; then
+              if [[ "$EVENT_NAME" == pull_request && "$same_repo" == true ]]; then
+                plan=true
+              elif [[ "$EVENT_NAME" == push && "$is_default_branch" == true ]]; then
+                plan=true
+              fi
+            fi
+          fi
+
+          apply=false
+          if [[ "$DESTROY" != true && "$is_default_branch" == true ]]; then
+            if [[ "$changed" == true || "$FORCE_APPLY" == true ]]; then
+              apply=true
+            fi
+          fi
+
+          destroy_plan="$DESTROY"
+          destroy=false
+          if [[ "$DESTROY" == true && "$is_default_branch" == true ]]; then
+            destroy=true
+          fi
+
+          # The rules above already give "false" for a merge queue run. Say
+          # it again here, so a later rule change cannot add AWS jobs to it.
+          if [[ "$EVENT_NAME" == merge_group ]]; then
+            plan=false apply=false destroy_plan=false destroy=false
+          fi
+
+          {
+            echo "changed=$changed"
+            echo "is_default_branch=$is_default_branch"
+            echo "same_repo=$same_repo"
+            echo "plan=$plan"
+            echo "apply=$apply"
+            echo "destroy_plan=$destroy_plan"
+            echo "destroy=$destroy"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Plan and apply, one tier at a time.
+  #
+  # Every job below uses the same `if:` pattern:
+  #   !cancelled() && !failure() && !contains(needs.*.result, 'cancelled')
+  #                                 run after skipped jobs, stop after failed
+  #                                 or cancelled ones (see the top of the file)
+  #   needs.setup.outputs.<rule>    the plan or apply rule from the setup job
+  #   plan jobs:  the tier has at least one deployment (a matrix cannot be empty)
+  #   apply jobs: the plan job for the same tier succeeded in this run
+
+  plan-develop:
+    needs: [validate, setup]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.plan == 'true' && needs.setup.outputs.develop != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: plan
+      deployments: ${{ needs.setup.outputs.develop }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  apply-develop:
+    needs: [validate, setup, plan-develop]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.apply == 'true' && needs.plan-develop.result == 'success' && needs.plan-develop.outputs.changed != '' && needs.plan-develop.outputs.changed != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: apply
+      deployments: ${{ needs.plan-develop.outputs.changed }}
+      environment: develop
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  plan-stage:
+    needs: [validate, setup, plan-develop, apply-develop]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.plan == 'true' && needs.setup.outputs.stage != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: plan
+      deployments: ${{ needs.setup.outputs.stage }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  apply-stage:
+    needs: [validate, setup, plan-develop, apply-develop, plan-stage]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.apply == 'true' && needs.plan-stage.result == 'success' && needs.plan-stage.outputs.changed != '' && needs.plan-stage.outputs.changed != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: apply
+      deployments: ${{ needs.plan-stage.outputs.changed }}
+      environment: stage
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  plan-prod:
+    needs: [validate, setup, plan-develop, apply-develop, plan-stage, apply-stage]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.plan == 'true' && needs.setup.outputs.prod != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: plan
+      deployments: ${{ needs.setup.outputs.prod }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  # The prod environment's required reviewers must approve this job before
+  # it starts.
+  apply-prod:
+    needs: [validate, setup, plan-develop, apply-develop, plan-stage, apply-stage, plan-prod]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.apply == 'true' && needs.plan-prod.result == 'success' && needs.plan-prod.outputs.changed != '' && needs.plan-prod.outputs.changed != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: apply
+      deployments: ${{ needs.plan-prod.outputs.changed }}
+      environment: prod
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Destroy, one tier at a time. Only runs on a manual run with destroy=true.
+  #
+  # destroy-plan-<tier> runs on any branch, so you can review what would be
+  # destroyed. destroy-<tier> runs only on the default branch, and the
+  # "destroy" environment's reviewers must approve it first. The jobs use the
+  # same `if:` and `needs:` pattern as the plan and apply jobs above.
+
+  destroy-plan-develop:
+    needs: [validate, setup]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy_plan == 'true' && needs.setup.outputs.develop != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy-plan
+      deployments: ${{ needs.setup.outputs.develop }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  destroy-develop:
+    needs: [validate, setup, destroy-plan-develop]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy == 'true' && needs.destroy-plan-develop.result == 'success' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy
+      deployments: ${{ needs.setup.outputs.develop }}
+      environment: destroy
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  destroy-plan-stage:
+    needs: [validate, setup, destroy-plan-develop, destroy-develop]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy_plan == 'true' && needs.setup.outputs.stage != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy-plan
+      deployments: ${{ needs.setup.outputs.stage }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  destroy-stage:
+    needs: [validate, setup, destroy-plan-develop, destroy-develop, destroy-plan-stage]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy == 'true' && needs.destroy-plan-stage.result == 'success' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy
+      deployments: ${{ needs.setup.outputs.stage }}
+      environment: destroy
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  destroy-plan-prod:
+    needs: [validate, setup, destroy-plan-develop, destroy-develop, destroy-plan-stage, destroy-stage]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy_plan == 'true' && needs.setup.outputs.prod != '[]' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy-plan
+      deployments: ${{ needs.setup.outputs.prod }}
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}
+
+  destroy-prod:
+    needs: [validate, setup, destroy-plan-develop, destroy-develop, destroy-plan-stage, destroy-stage, destroy-plan-prod]
+    if: ${{ !cancelled() && !failure() && !contains(needs.*.result, 'cancelled') && needs.setup.outputs.destroy == 'true' && needs.destroy-plan-prod.result == 'success' }}
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/tf-deploy.yml
+    with:
+      command: destroy
+      deployments: ${{ needs.setup.outputs.prod }}
+      environment: destroy
+      role-duration-seconds: ${{ fromJSON(needs.setup.outputs.role_duration_seconds) }}
+      timeout-minutes: ${{ fromJSON(needs.setup.outputs.timeout_minutes) }}

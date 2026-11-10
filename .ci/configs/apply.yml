@@ -1,0 +1,22 @@
+# Add one apply job for each deployment, using the example below as a
+#   template. Set DEPLOYMENT to the name of the config file in
+#   deployments/configs/ without ".yaml". The name is <env>-<deployment_id>.
+#   Set the stage to apply-<env>, for example apply-develop.
+#   The apply job uses the plan job's artifacts (plan file, lock file copy and
+#   change marker). `needs:` lists the plan job, so the apply job waits for it
+#   and downloads only its artifacts.
+
+# develop-a1b2c3d4-apply:
+#   stage: apply-develop
+#   extends: .apply
+#   needs:
+#     - develop-a1b2c3d4-plan
+#   variables:
+#     DEPLOYMENT: develop-a1b2c3d4
+
+# GitLab rejects an included file that holds no configuration, so this stub
+# keeps the file valid while every job above is still commented out. Delete it
+# once you add your first real job.
+.apply-placeholder:
+  rules:
+    - when: never

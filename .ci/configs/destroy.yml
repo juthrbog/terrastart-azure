@@ -1,0 +1,29 @@
+# Add one destroy-plan job and one destroy job for each deployment, using the
+#   example below as a template. Set DEPLOYMENT to the name of the config file
+#   in deployments/configs/ without ".yaml". The name is <env>-<deployment_id>.
+#   Set the stage of both jobs to destroy-<env>, for example destroy-develop.
+#   The destroy job uses the destroy-plan job's artifacts (plan file and lock
+#   file copy). Both jobs are in the same stage, so `needs:` must list the
+#   destroy-plan job. Then the destroy job waits for it and downloads its
+#   artifacts.
+
+# develop-a1b2c3d4-destroy-plan:
+#   stage: destroy-develop
+#   extends: .destroy-plan
+#   variables:
+#     DEPLOYMENT: develop-a1b2c3d4
+#
+# develop-a1b2c3d4-destroy:
+#   stage: destroy-develop
+#   extends: .destroy
+#   needs:
+#     - develop-a1b2c3d4-destroy-plan
+#   variables:
+#     DEPLOYMENT: develop-a1b2c3d4
+
+# GitLab rejects an included file that holds no configuration, so this stub
+# keeps the file valid while every job above is still commented out. Delete it
+# once you add your first real job.
+.destroy-placeholder:
+  rules:
+    - when: never

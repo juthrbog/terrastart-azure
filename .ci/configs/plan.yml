@@ -1,0 +1,17 @@
+# Add one plan job for each deployment, using the example below as a template.
+#   Set DEPLOYMENT to the name of the config file in deployments/configs/
+#   without ".yaml". The name is <env>-<deployment_id>. Set the stage
+#   to plan-<env>, for example plan-develop.
+
+# develop-a1b2c3d4-plan:
+#   stage: plan-develop
+#   extends: .plan
+#   variables:
+#     DEPLOYMENT: develop-a1b2c3d4
+
+# GitLab rejects an included file that holds no configuration, so this stub
+# keeps the file valid while every job above is still commented out. Delete it
+# once you add your first real job.
+.plan-placeholder:
+  rules:
+    - when: never
